@@ -32,7 +32,8 @@ HEADERS  = {'x-api-key': API_KEY, 'Content-Type': 'application/json'}
 
 today = date.today()
 
-# Month labels for M2→M1→M0 (3 full months) + Today
+# Month labels for M3→M2→M1→M0
+m3_label = (today.replace(day=1) - relativedelta(months=3)).strftime('%b %Y')
 m2_label = (today.replace(day=1) - relativedelta(months=2)).strftime('%b %Y')
 m1_label = (today.replace(day=1) - relativedelta(months=1)).strftime('%b %Y')
 m0_label =  today.replace(day=1).strftime('%b %Y')
@@ -248,49 +249,36 @@ st.divider()
 # ── Active Base ───────────────────────────────────────────────────────────────
 st.subheader("👥 Active Customer Base")
 st.caption(
-    f"**Active Base (Today)** = customers with active recharge + those within 15-day grace window after last recharge. "
-    f"**Monthly Renewals** = customers who renewed in that cycle — excludes new installs & grace window customers. "
-    f"Active Base is always **greater than** renewals. Rating & Device SLA bonus are calculated on renewals."
+    f"**Active Base** = customers with active recharge + those within 15-day grace window. "
+    f"Shown month-end for {m3_label}–{m1_label}, and MTD for {m0_label}. "
+    f"Rating & Device SLA bonus are calculated on renewals (not active base)."
 )
 
-active_base = safe_int(row.get('ACTIVE_BASE'))
-
-# Monthly renewals M2→M1→M0 from card 7876
-m2_renewals = safe_int(row.get('M2_RATING_BONUS_RENEWALS'))
-m1_renewals = safe_int(row.get('M1_RATING_BONUS_RENEWALS'))
-m0_renewals = safe_int(row.get('M0_RATING_BONUS_RENEWALS'))
-
-# Dec 15 snapshot from partner_growth_card_raw if available
-dec15 = safe_int(pgc.get('active_customer_15d_m3')) if pgc is not None else 0
+# Monthly active base M3→M0 from partner_growth_card_raw (active_customer_15d includes 15-day grace window)
+m3_active = safe_int(pgc.get('active_customer_15d_m3')) if pgc is not None else 0
+m2_active  = safe_int(pgc.get('active_customer_15d_m2')) if pgc is not None else 0
+m1_active  = safe_int(pgc.get('active_customer_15d_m1')) if pgc is not None else 0
+m0_active  = safe_int(pgc.get('active_customer_15d_m0')) if pgc is not None else 0
 
 # Display metrics
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Dec 15 (Snapshot)", dec15)
-c2.metric(f"Renewals {m2_label}", m2_renewals, delta=m2_renewals - dec15 if dec15 else None)
-c3.metric(f"Renewals {m1_label}", m1_renewals, delta=m1_renewals - m2_renewals)
-c4.metric(f"Renewals {m0_label}", m0_renewals, delta=m0_renewals - m1_renewals)
-c5.metric("Active Base (Today)", active_base,
-          help="Renewals + new installs + 15-day grace window customers")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric(f"Active Base {m3_label}", m3_active)
+c2.metric(f"Active Base {m2_label}", m2_active, delta=m2_active - m3_active if m3_active else None)
+c3.metric(f"Active Base {m1_label}", m1_active, delta=m1_active - m2_active if m2_active else None)
+c4.metric(f"Active Base {m0_label}", m0_active, delta=m0_active - m1_active if m1_active else None,
+          help="Customers with active recharge + those within 15-day grace window")
 
 fig_ac = go.Figure()
 fig_ac.add_trace(go.Bar(
-    name='Renewals',
-    x=[f'Dec 15', m2_label, m1_label, m0_label],
-    y=[dec15, m2_renewals, m1_renewals, m0_renewals],
+    name='Active Base',
+    x=[m3_label, m2_label, m1_label, m0_label],
+    y=[m3_active, m2_active, m1_active, m0_active],
     marker_color='#636EFA',
-    text=[dec15, m2_renewals, m1_renewals, m0_renewals],
-    textposition='outside'
-))
-fig_ac.add_trace(go.Bar(
-    name='Active Base (Today, incl. grace)',
-    x=['Today'],
-    y=[active_base],
-    marker_color='#00CC96',
-    text=[active_base],
+    text=[m3_active, m2_active, m1_active, m0_active],
     textposition='outside'
 ))
 fig_ac.update_layout(
-    title="Monthly Renewals Trend + Today's Active Base (incl. 15-day grace window)",
+    title="Monthly Active Base Trend (incl. 15-day grace window)",
     yaxis_title="Customers",
     plot_bgcolor='rgba(0,0,0,0)',
     height=300, margin=dict(t=40, b=20)
