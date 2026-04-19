@@ -135,6 +135,45 @@ def fetch_live_tickets_m0(partner_id):
         return 0, 0
 
 
+@st.cache_data(ttl=3600)
+def fetch_active_base_all_months(partner_id):
+    """
+    Returns (m0, m1, m2, m3) active base using the same PJK/ACTIVE_CUST methodology:
+    - M0: PARTNER_JANAM_KUNDLI.ACTIVE_CUSTOMER (same source as PJK dashboard)
+    - M1/M2/M3: CUSTOMER_METRICS SCD2 with PLAN_EXPIRY + 15-day grace at each month-end
+    """
+    from dateutil.relativedelta import relativedelta as rdelta
+
+    # M0 from PJK (exact match with what PJK dashboard shows)
+    m0 = 0
+    try:
+        df = run_sql(f"SELECT ACTIVE_CUSTOMER FROM PARTNER_JANAM_KUNDLI WHERE PARTNER_ID = {partner_id}")
+        if df is not None and len(df) > 0:
+            m0 = safe_int(df.iloc[0]['ACTIVE_CUSTOMER'])
+    except Exception:
+        pass
+
+    # M1/M2/M3 from CUSTOMER_METRICS SCD2 — same 15-day grace logic as ACTIVE_CUST
+    results = [m0]
+    for i in range(1, 4):
+        month_end = (today.replace(day=1) - rdelta(months=i) + rdelta(months=1) - rdelta(days=1))
+        sql = f"""
+        SELECT COUNT(DISTINCT CUSTOMER_NAS)
+        FROM CUSTOMER_DB_CUSTOMER_PROFILE_SERVICE_PUBLIC.CUSTOMER_METRICS
+        WHERE LCO_ACCOUNT_ID = {partner_id}
+          AND _FIVETRAN_START::DATE <= '{month_end}'
+          AND _FIVETRAN_END::DATE > '{month_end}'
+          AND DATEADD(day, 15, PLAN_EXPIRY_DATE::DATE) >= '{month_end}'
+        """
+        try:
+            df = run_sql(sql)
+            results.append(safe_int(df.iloc[0][0]) if df is not None and len(df) > 0 else 0)
+        except Exception:
+            results.append(0)
+
+    return tuple(results)  # (m0, m1, m2, m3)
+
+
 @st.cache_data(ttl=86400)
 def fetch_fixed_payout_monthly(partner_id):
     """Get actual monthly fixed per-renewal payout from PARTNER_BONUS_DISBURSEMENT (BONUS_STATUS=5 = paid)."""
@@ -254,11 +293,10 @@ st.caption(
     f"Rating & Device SLA bonus are calculated on renewals (not active base)."
 )
 
-# Monthly active base M3→M0 from partner_growth_card_raw (active_customer_15d includes 15-day grace window)
-m3_active = safe_int(pgc.get('active_customer_15d_m3')) if pgc is not None else 0
-m2_active  = safe_int(pgc.get('active_customer_15d_m2')) if pgc is not None else 0
-m1_active  = safe_int(pgc.get('active_customer_15d_m1')) if pgc is not None else 0
-m0_active  = safe_int(pgc.get('active_customer_15d_m0')) if pgc is not None else 0
+# M0: PARTNER_JANAM_KUNDLI (matches PJK dashboard)
+# M1/M2/M3: CUSTOMER_METRICS SCD2 with same 15-day grace logic as PJK/ACTIVE_CUST
+with st.spinner("Loading active base..."):
+    m0_active, m1_active, m2_active, m3_active = fetch_active_base_all_months(partner_id)
 
 # Display metrics
 c1, c2, c3, c4 = st.columns(4)
