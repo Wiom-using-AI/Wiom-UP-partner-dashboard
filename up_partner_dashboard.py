@@ -83,30 +83,66 @@ def safe_float(val):
 
 @st.cache_data(ttl=86400)
 def fetch_card7876_all():
-    """Fetch all partners from card 7876 (Partner wise earnings view)."""
-    if not API_KEY:
-        raise RuntimeError("METABASE_API_KEY not set")
-    r = requests.post(
-        f"{BASE_URL}/api/card/7876/query",
-        headers=HEADERS, json={}, timeout=120
-    )
-    data = r.json()
-    if isinstance(data, dict) and data.get('status') == 'failed':
-        raise RuntimeError(f"Card query failed: {data.get('error', 'unknown')}")
-    result = data.get('data', data) if isinstance(data, dict) else {}
-    cols = [c['name'] for c in result.get('cols', [])]
-    rows = result.get('rows', [])
-    df = pd.DataFrame(rows, columns=cols)
-    # Filter UP zones
-    return df[df['ZONE'].isin(UP_ZONES)].reset_index(drop=True)
+    """Fetch all UP partners directly from PARTNER_GROWTH_CARD_RAW (card 7876 source broke)."""
+    zones_sql = "','".join(UP_ZONES)
+    sql = f"""
+SELECT
+    PARTNER_ID AS PARTNER_ACCOUNT_ID,
+    PARTNER_NAME,
+    ZONE,
+    ACTIVE_CUSTOMER AS ACTIVE_BASE,
+    PARTNER_STATUS,
+    LIFE_TIME_EARNING AS LIFETIME_EARNING,
+    FIXED_BONUS_M0 AS M0_FIXED_PAYOUT,
+    CLAIM_RATING_BONUS_M0 AS M0_RATING_BONUS_PAYOUT,
+    CLAIM_WORK_BONUS_M0 AS M0_SERVICE_SLA_BONUS_PAYOUT,
+    CLAIM_DEVICE_BONUS_M0 AS M0_DEVICE_SLA_BONUS_PAYOUT,
+    (COALESCE(FIXED_BONUS_M0,0)+COALESCE(CLAIM_RATING_BONUS_M0,0)+COALESCE(CLAIM_WORK_BONUS_M0,0)+COALESCE(CLAIM_DEVICE_BONUS_M0,0)) AS TOTAL_M0_PAYOUT,
+    INSTALLS_M0 AS M0_INSTALLS_MTD,
+    NOTIFS_M0 AS M0_NOTIFICATIONS_MTD,
+    INTERSTS_M0 AS M0_INTERESTS_MTD,
+    TOTAL_RENEWALS_M0 AS M0_RATING_BONUS_RENEWALS,
+    0 AS M0_RATING_AT_PAYOUT,
+    FIXED_BONUS_M1 AS M1_FIXED_PAYOUT,
+    CLAIM_RATING_BONUS_M1 AS M1_RATING_BONUS_PAYOUT,
+    CLAIM_WORK_BONUS_M1 AS M1_SERVICE_SLA_BONUS_PAYOUT,
+    CLAIM_DEVICE_BONUS_M1 AS M1_DEVICE_SLA_BONUS_PAYOUT,
+    (COALESCE(FIXED_BONUS_M1,0)+COALESCE(CLAIM_RATING_BONUS_M1,0)+COALESCE(CLAIM_WORK_BONUS_M1,0)+COALESCE(CLAIM_DEVICE_BONUS_M1,0)) AS TOTAL_M1_PAYOUT,
+    INSTALLS_M1 AS M1_INSTALLS,
+    NOTIFS_M1 AS M1_NOTIFICATIONS,
+    INTERSTS_M1 AS M1_INTERESTS,
+    TOTAL_RENEWALS_M1 AS M1_RATING_BONUS_RENEWALS,
+    0 AS M1_RATING_AT_PAYOUT,
+    FIXED_BONUS_M2 AS M2_FIXED_PAYOUT,
+    CLAIM_RATING_BONUS_M2 AS M2_RATING_BONUS_PAYOUT,
+    CLAIM_WORK_BONUS_M2 AS M2_SERVICE_SLA_BONUS_PAYOUT,
+    CLAIM_DEVICE_BONUS_M2 AS M2_DEVICE_SLA_BONUS_PAYOUT,
+    (COALESCE(FIXED_BONUS_M2,0)+COALESCE(CLAIM_RATING_BONUS_M2,0)+COALESCE(CLAIM_WORK_BONUS_M2,0)+COALESCE(CLAIM_DEVICE_BONUS_M2,0)) AS TOTAL_M2_PAYOUT,
+    INSTALLS_M2 AS M2_INSTALLS,
+    NOTIFS_M2 AS M2_NOTIFICATIONS,
+    INTERSTS_M2 AS M2_INTERESTS,
+    TOTAL_RENEWALS_M2 AS M2_RATING_BONUS_RENEWALS,
+    0 AS M2_RATING_AT_PAYOUT,
+    CASE WHEN COALESCE(SERVICE_TICKET_M0,0)>0 THEN COALESCE(SERVICE_TICKET_SLA_M0,0)::FLOAT/SERVICE_TICKET_M0 ELSE 0 END AS CURRENT_SERVICE_SLA,
+    CASE WHEN COALESCE(DEVICE_TICKET_M0,0)>0 THEN COALESCE(DEVICE_TICKET_SLA_M0,0)::FLOAT/DEVICE_TICKET_M0 ELSE 0 END AS CURRENT_DEVICE_SLA,
+    0 AS CURRENT_RATING,
+    0 AS PARTNER_LOTTERY_EARNING,
+    0 AS ROHIT_LOTTERY_EARNING
+FROM PUBLIC.PARTNER_GROWTH_CARD_RAW
+WHERE ZONE IN ('{zones_sql}')
+"""
+    return run_sql(sql)
 
 
 @st.cache_data(ttl=86400)
 def fetch_partner_growth_card(partner_id):
-    """Supplement data from partner_growth_card_raw for tickets + Dec 15 snapshot."""
-    sql = f'SELECT * FROM PUBLIC."partner_growth_card_raw" WHERE "partner_id" = {partner_id}'
+    """Supplement data from PARTNER_GROWTH_CARD_RAW for tickets + SLA."""
+    sql = f'SELECT * FROM PUBLIC.PARTNER_GROWTH_CARD_RAW WHERE PARTNER_ID = {partner_id}'
     df = run_sql(sql)
-    return df.iloc[0] if len(df) > 0 else None
+    if df is None or len(df) == 0:
+        return None
+    row = df.iloc[0]
+    return {k.lower(): v for k, v in row.items()}
 
 
 @st.cache_data(ttl=3600)
@@ -428,7 +464,7 @@ st.plotly_chart(fig_earn, use_container_width=True)
 fixed_source_note = []
 for i, (key, label) in enumerate([(m2_key, m2_label), (m1_key, m1_label), (m0_key, m0_label)]):
     if card_fixed[i] == 0 and fixed_payout_actual.get(key, 0) > 0:
-        fixed_source_note.append(f"**{label}** fixed payout pulled from `PARTNER_BONUS_DISBURSEMENT` (card 7876 showed ₹0)")
+        fixed_source_note.append(f"**{label}** fixed payout pulled from `PARTNER_BONUS_DISBURSEMENT` (growth card showed ₹0)")
 if fixed_source_note:
     st.caption("ℹ️ " + " · ".join(fixed_source_note))
 
@@ -537,4 +573,4 @@ with st.expander("📋 View All Partner Fields"):
     raw = pd.DataFrame([dict(row)]).T.rename(columns={0: 'Value'})
     st.dataframe(raw, use_container_width=True)
 
-st.caption(f"Source: Metabase card 7876 (Partner Wise Earnings View) · Partner ID: {partner_id}")
+st.caption(f"Source: PARTNER_GROWTH_CARD_RAW (Snowflake) · Partner ID: {partner_id}")
