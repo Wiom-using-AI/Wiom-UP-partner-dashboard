@@ -146,6 +146,29 @@ def fetch_partner_growth_card(partner_id):
 
 
 @st.cache_data(ttl=3600)
+def fetch_pjk_data(partner_id):
+    """Fetch partner rating scores and SLA history from PARTNER_JANAM_KUNDLI."""
+    sql = f"""
+    SELECT SERVICE_RATING, AVG_INSTALL_RATING,
+           SERVICE_TICKET_M1, SERVICE_TICKET_SLA_M1,
+           SERVICE_TICKET_M2, SERVICE_TICKET_SLA_M2,
+           SERVICE_TICKET_M3, SERVICE_TICKET_SLA_M3,
+           DEVICE_TICKET_M1, DEVICE_TICKET_SLA_M1,
+           DEVICE_TICKET_M2, DEVICE_TICKET_SLA_M2,
+           DEVICE_TICKET_M3, DEVICE_TICKET_SLA_M3
+    FROM PUBLIC.PARTNER_JANAM_KUNDLI
+    WHERE PARTNER_ID = {partner_id}
+    """
+    try:
+        df = run_sql(sql)
+        if df is not None and len(df) > 0:
+            return {k.lower(): v for k, v in df.iloc[0].items()}
+    except Exception:
+        pass
+    return {}
+
+
+@st.cache_data(ttl=3600)
 def fetch_live_tickets_m0(partner_id):
     """Fetch current-month ticket counts from TICKETVANILLA_AUDIT (used when growth card m0 = 0)."""
     m0_start = today.replace(day=1).strftime('%Y-%m-01')
@@ -293,19 +316,46 @@ if not selected_name:
 row = all_df[all_df['PARTNER_NAME'] == selected_name].iloc[0]
 partner_id = int(float(row['PARTNER_ACCOUNT_ID']))
 
-# Load supplementary data (tickets + Dec 15)
+# Load supplementary data (tickets + growth card)
 try:
     pgc = fetch_partner_growth_card(partner_id)
 except Exception:
     pgc = None
 
+# Load PJK for rating scores and SLA history
+try:
+    pjk = fetch_pjk_data(partner_id)
+except Exception:
+    pjk = {}
+
 # ── Partner Header ─────────────────────────────────────────────────────────────
+# Rating: use SERVICE_RATING from PARTNER_JANAM_KUNDLI (actual partner rating score)
+service_rating = safe_float(pjk.get('service_rating'))
+
+# SLA: find most recent month that has tickets (M1 → M2 → M3), compute % from count/total
+def _best_sla(ticket_key, sla_key, pjk_data):
+    for suffix in ['m1', 'm2', 'm3']:
+        total = safe_int(pjk_data.get(f'{ticket_key}_{suffix}', 0))
+        met = safe_int(pjk_data.get(f'{sla_key}_{suffix}', 0))
+        if total > 0:
+            m_label_map = {'m1': m1_label, 'm2': m2_label, 'm3': m3_label}
+            return met / total * 100, m_label_map[suffix]
+    return None, None
+
+svc_sla_pct, svc_m_lbl = _best_sla('service_ticket', 'service_ticket_sla', pjk)
+dev_sla_pct, dev_m_lbl = _best_sla('device_ticket', 'device_ticket_sla', pjk)
+
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Zone", str(row.get('ZONE', '-')))
 c2.metric("Status", str(row.get('PARTNER_STATUS', '-')))
-c3.metric("Rating", f"{safe_float(row.get('CURRENT_RATING')):.2f}")
-c4.metric("Device SLA", f"{safe_float(row.get('CURRENT_DEVICE_SLA'))*100:.1f}%")
-c5.metric("Service SLA", f"{safe_float(row.get('CURRENT_SERVICE_SLA'))*100:.1f}%")
+c3.metric("Service Rating", f"{service_rating:.1f} ★" if service_rating else "N/A",
+          help="Partner's average service rating from PARTNER_JANAM_KUNDLI")
+c4.metric(f"Device SLA ({dev_m_lbl})" if dev_m_lbl else "Device SLA",
+          f"{dev_sla_pct:.1f}%" if dev_sla_pct is not None else "N/A",
+          help="Most recent month with device tickets (SLA = tickets resolved on time / total)")
+c5.metric(f"Service SLA ({svc_m_lbl})" if svc_m_lbl else "Service SLA",
+          f"{svc_sla_pct:.1f}%" if svc_sla_pct is not None else "N/A",
+          help="Most recent month with service tickets (SLA = tickets resolved on time / total)")
 
 st.divider()
 
@@ -330,20 +380,51 @@ c3.metric(f"Active Base {m1_label}", m1_active, delta=m1_active - m2_active if m
 c4.metric(f"Active Base {m0_label}", m0_active, delta=m0_active - m1_active if m1_active else None,
           help="Customers with active recharge + those within 15-day grace window")
 
+# Get lost customers from pgc (all columns already fetched)
+m3_lost = safe_int(pgc.get('lost_customers_m3')) if pgc else 0
+m2_lost = safe_int(pgc.get('lost_customers_m2')) if pgc else 0
+m1_lost = safe_int(pgc.get('lost_customers_m1')) if pgc else 0
+m0_lost = safe_int(pgc.get('lost_customers_m0')) if pgc else 0
+
+month_labels_4 = [m3_label, m2_label, m1_label, m0_label]
+active_vals = [m3_active, m2_active, m1_active, m0_active]
+lost_vals   = [m3_lost, m2_lost, m1_lost, m0_lost]
+
+# Zoom Y-axis to actual data range so small changes are visible
+nonzero = [v for v in active_vals if v > 0]
+y_min = max(0, int(min(nonzero) * 0.85)) if nonzero else 0
+y_max = int(max(nonzero) * 1.15) if nonzero else 10
+
 fig_ac = go.Figure()
 fig_ac.add_trace(go.Bar(
     name='Active Base',
-    x=[m3_label, m2_label, m1_label, m0_label],
-    y=[m3_active, m2_active, m1_active, m0_active],
+    x=month_labels_4,
+    y=active_vals,
     marker_color='#636EFA',
-    text=[m3_active, m2_active, m1_active, m0_active],
+    text=active_vals,
     textposition='outside'
 ))
+if any(v > 0 for v in lost_vals):
+    fig_ac.add_trace(go.Bar(
+        name='Lost Customers',
+        x=month_labels_4,
+        y=lost_vals,
+        marker_color='#EF553B',
+        text=lost_vals,
+        textposition='outside',
+        yaxis='y2'
+    ))
+    fig_ac.update_layout(
+        yaxis2=dict(title='Lost Customers', overlaying='y', side='right',
+                    showgrid=False, zeroline=False)
+    )
 fig_ac.update_layout(
     title="Monthly Active Base Trend (incl. 15-day grace window)",
     yaxis_title="Customers",
+    yaxis=dict(range=[y_min, y_max]),
+    barmode='group',
     plot_bgcolor='rgba(0,0,0,0)',
-    height=300, margin=dict(t=40, b=20)
+    height=320, margin=dict(t=40, b=20)
 )
 st.plotly_chart(fig_ac, use_container_width=True)
 
