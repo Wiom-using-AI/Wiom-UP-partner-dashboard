@@ -211,7 +211,8 @@ def fetch_active_base_all_months(partner_id):
         """)
         if df is not None and len(df) > 0:
             r = df.iloc[0]
-            m0 = safe_int(r['ACTIVE_CUSTOMER'])
+            # Use 15D definition for all months so the trend is comparable
+            m0 = safe_int(r['ACTIVE_CUSTOMER_15D_M0'])
             m1 = safe_int(r['ACTIVE_CUSTOMER_15D_M1'])
             m2 = safe_int(r['ACTIVE_CUSTOMER_15D_M2'])
             m3 = safe_int(r['ACTIVE_CUSTOMER_15D_M3'])
@@ -332,18 +333,23 @@ except Exception:
 # Rating: use SERVICE_RATING from PARTNER_JANAM_KUNDLI (actual partner rating score)
 service_rating = safe_float(pjk.get('service_rating'))
 
-# SLA: find most recent month that has tickets (M1 → M2 → M3), compute % from count/total
-def _best_sla(ticket_key, sla_key, pjk_data):
+# SLA: check growth card first (pgc), then PJK — M1 → M2 → M3 fallback
+# Growth card and PJK may have different refresh cadences; use whichever has data
+def _best_sla(ticket_key, sla_key, pgc_data, pjk_data):
+    m_label_map = {'m1': m1_label, 'm2': m2_label, 'm3': m3_label}
     for suffix in ['m1', 'm2', 'm3']:
-        total = safe_int(pjk_data.get(f'{ticket_key}_{suffix}', 0))
-        met = safe_int(pjk_data.get(f'{sla_key}_{suffix}', 0))
-        if total > 0:
-            m_label_map = {'m1': m1_label, 'm2': m2_label, 'm3': m3_label}
-            return met / total * 100, m_label_map[suffix]
+        # Try growth card first, then PJK
+        for src in [pgc_data, pjk_data]:
+            if src is None:
+                continue
+            total = safe_int(src.get(f'{ticket_key}_{suffix}', 0))
+            met   = safe_int(src.get(f'{sla_key}_{suffix}', 0))
+            if total > 0:
+                return met / total * 100, m_label_map[suffix]
     return None, None
 
-svc_sla_pct, svc_m_lbl = _best_sla('service_ticket', 'service_ticket_sla', pjk)
-dev_sla_pct, dev_m_lbl = _best_sla('device_ticket', 'device_ticket_sla', pjk)
+svc_sla_pct, svc_m_lbl = _best_sla('service_ticket', 'service_ticket_sla', pgc, pjk)
+dev_sla_pct, dev_m_lbl = _best_sla('device_ticket', 'device_ticket_sla', pgc, pjk)
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Zone", str(row.get('ZONE', '-')))
@@ -356,6 +362,10 @@ c4.metric(f"Device SLA ({dev_m_lbl})" if dev_m_lbl else "Device SLA",
 c5.metric(f"Service SLA ({svc_m_lbl})" if svc_m_lbl else "Service SLA",
           f"{svc_sla_pct:.1f}%" if svc_sla_pct is not None else "N/A",
           help="Most recent month with service tickets (SLA = tickets resolved on time / total)")
+
+# Warn when SLA is showing older than last month (pipeline lag on 1st of month)
+if svc_m_lbl == m2_label or dev_m_lbl == m2_label:
+    st.caption(f"ℹ️ SLA shows {m2_label} — {m1_label} data not yet available in the pipeline (usually updates by the 3rd of the month).")
 
 st.divider()
 
