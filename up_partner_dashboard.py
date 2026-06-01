@@ -396,6 +396,22 @@ m2_lost = safe_int(pgc.get('lost_customers_m2')) if pgc else 0
 m1_lost = safe_int(pgc.get('lost_customers_m1')) if pgc else 0
 m0_lost = safe_int(pgc.get('lost_customers_m0')) if pgc else 0
 
+churn_label = "Lost Customers"
+churn_estimated = False
+# When LOST_CUSTOMERS is not populated in pipeline, estimate from installs vs net base change
+# Implied churn = new installs - net base increase (captures customers who didn't renew)
+if pgc and not any([m3_lost, m2_lost, m1_lost, m0_lost]):
+    m2_inst = safe_int(pgc.get('installs_m2', 0))
+    m1_inst = safe_int(pgc.get('installs_m1', 0))
+    m0_inst = safe_int(pgc.get('installs_m0', 0))
+    m2_lost = max(0, m2_inst - (m2_active - m3_active))
+    m1_lost = max(0, m1_inst - (m1_active - m2_active))
+    m0_lost = max(0, m0_inst - (m0_active - m1_active))
+    m3_lost = 0
+    if any([m2_lost, m1_lost, m0_lost]):
+        churn_label = "Est. Churned *"
+        churn_estimated = True
+
 month_labels_4 = [m3_label, m2_label, m1_label, m0_label]
 active_vals = [m3_active, m2_active, m1_active, m0_active]
 lost_vals   = [m3_lost, m2_lost, m1_lost, m0_lost]
@@ -416,7 +432,7 @@ fig_ac.add_trace(go.Bar(
 ))
 if any(v > 0 for v in lost_vals):
     fig_ac.add_trace(go.Bar(
-        name='Lost Customers',
+        name=churn_label,
         x=month_labels_4,
         y=lost_vals,
         marker_color='#EF553B',
@@ -425,7 +441,7 @@ if any(v > 0 for v in lost_vals):
         yaxis='y2'
     ))
     fig_ac.update_layout(
-        yaxis2=dict(title='Lost Customers', overlaying='y', side='right',
+        yaxis2=dict(title=churn_label.replace(' *',''), overlaying='y', side='right',
                     showgrid=False, zeroline=False)
     )
 fig_ac.update_layout(
@@ -437,6 +453,9 @@ fig_ac.update_layout(
     height=320, margin=dict(t=40, b=20)
 )
 st.plotly_chart(fig_ac, use_container_width=True)
+if churn_estimated:
+    st.caption("\\* Est. Churned = new installs that month minus net base change. "
+               "Explains why installs don't show 1-for-1 in the active base.")
 
 st.divider()
 
