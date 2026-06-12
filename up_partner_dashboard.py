@@ -336,9 +336,14 @@ service_rating = safe_float(pjk.get('service_rating'))
 # SLA: check growth card first (pgc), then PJK — M1 → M2 → M3 fallback
 # Growth card and PJK may have different refresh cadences; use whichever has data
 def _best_sla(ticket_key, sla_key, pgc_data, pjk_data):
-    m_label_map = {'m1': m1_label, 'm2': m2_label, 'm3': m3_label}
-    for suffix in ['m1', 'm2', 'm3']:
-        # Try growth card first, then PJK
+    # Try M1 (last complete month) → M0 (current MTD) → M2 → M3
+    m_label_map = {
+        'm0': f'{m0_label} MTD',
+        'm1': m1_label,
+        'm2': m2_label,
+        'm3': m3_label,
+    }
+    for suffix in ['m1', 'm0', 'm2', 'm3']:
         for src in [pgc_data, pjk_data]:
             if src is None:
                 continue
@@ -363,9 +368,11 @@ c5.metric(f"Service SLA ({svc_m_lbl})" if svc_m_lbl else "Service SLA",
           f"{svc_sla_pct:.1f}%" if svc_sla_pct is not None else "N/A",
           help="Most recent month with service tickets (SLA = tickets resolved on time / total)")
 
-# Warn when SLA is showing older than last month (pipeline lag on 1st of month)
-if svc_m_lbl == m2_label or dev_m_lbl == m2_label:
-    st.caption(f"ℹ️ SLA shows {m2_label} — {m1_label} data not yet available in the pipeline (usually updates by the 3rd of the month).")
+# Warn when falling back past M0 MTD — pipeline hasn't refreshed M1 yet
+if svc_m_lbl in (m2_label, m3_label) or dev_m_lbl in (m2_label, m3_label):
+    st.caption(f"ℹ️ SLA shows {m2_label} — {m1_label} data not yet available in the pipeline.")
+elif f'{m0_label} MTD' in (svc_m_lbl or '', dev_m_lbl or ''):
+    st.caption(f"ℹ️ SLA shows {m0_label} MTD — {m1_label} data not yet in pipeline; showing current month so far.")
 
 st.divider()
 
