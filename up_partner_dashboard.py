@@ -224,7 +224,8 @@ def fetch_active_base_all_months(partner_id):
 
 @st.cache_data(ttl=86400)
 def fetch_fixed_payout_monthly(partner_id):
-    """Get actual monthly fixed per-renewal payout from PARTNER_BONUS_DISBURSEMENT (BONUS_STATUS=5 = paid)."""
+    """Get monthly fixed per-renewal payout from PARTNER_BONUS_DISBURSEMENT.
+    For past months: BONUS_STATUS=5 (paid only). For current month: all statuses (accrued + paid)."""
     dec_start = (today.replace(day=1) - relativedelta(months=3)).strftime('%Y-%m-01')
     sql = f"""
     SELECT
@@ -233,9 +234,9 @@ def fetch_fixed_payout_monthly(partner_id):
         COUNT(*) AS renewal_count
     FROM DYNAMODB.PARTNER_BONUS_DISBURSEMENT
     WHERE ACCOUNT_ID = {partner_id}
-      AND BONUS_STATUS = 5
       AND _FIVETRAN_DELETED = FALSE
       AND ADDED_TIME >= '{dec_start}'
+      AND (BONUS_STATUS = 5 OR DATE_TRUNC('month', ADDED_TIME::DATE) = DATE_TRUNC('month', CURRENT_DATE))
     GROUP BY 1
     ORDER BY 1 DESC
     """
@@ -540,7 +541,8 @@ avg_3m = sum(total_payouts[:3]) / 3 if any(total_payouts) else 0
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Lifetime Earning", f"₹{lifetime:,.0f}")
 c2.metric("Avg Monthly Earning (3M)", f"₹{avg_3m:,.0f}")
-c3.metric(f"{m0_label} Payout (MTD)", f"₹{total_payouts[2]:,.0f}")
+c3.metric(f"{m0_label} Payout (MTD)", f"₹{total_payouts[2]:,.0f}",
+          help="Fixed payout = all accrued renewals this month (including unpaid). Rating & SLA bonuses are calculated at month-end.")
 c4.metric("Partner Lottery (Lifetime)", f"₹{partner_lottery:,.0f}",
           help=f"Rohit Lottery: ₹{rohit_lottery:,.0f} · Both are lifetime totals from earnings view")
 
