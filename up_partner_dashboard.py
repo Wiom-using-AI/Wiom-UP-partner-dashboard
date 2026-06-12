@@ -277,7 +277,14 @@ def fetch_rohit_earnings(partner_id):
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 st.title("📊 UP Partner Dashboard")
-st.caption(f"Last refreshed: {datetime.now().strftime('%d %b %Y, %I:%M %p')} · Auto-refreshes daily · Source: Partner Wise Earnings View")
+col_title, col_btn = st.columns([6, 1])
+with col_title:
+    st.caption(f"Last refreshed: {datetime.now().strftime('%d %b %Y, %I:%M %p')} · Source: Partner Wise Earnings View")
+with col_btn:
+    if st.button("🔄 Refresh", use_container_width=True):
+        st.cache_data.clear()
+        st.session_state.last_refresh = time.time()
+        st.rerun()
 
 try:
     with st.spinner("Loading UP partners from earnings view..."):
