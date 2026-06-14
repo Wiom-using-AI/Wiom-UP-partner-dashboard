@@ -682,6 +682,54 @@ if rohit_df is not None and len(rohit_df) > 0:
 else:
     st.info("No Rohit earning data found for this partner in the selected period.")
 
+st.divider()
+
+# ── Wallet Transactions ───────────────────────────────────────────────────────
+st.subheader("💳 Wallet Transactions (Last 100)")
+
+@st.cache_data(ttl=1800)
+def fetch_wallet_transactions(pid):
+    sql = f"""
+    SELECT ACTION, REMARK, CREDIT_DELTA, BALANCE, ADDED_AT_IST
+    FROM PROD_DB.DBT_CSP.STG_CSP_BALANCE_SHEET
+    WHERE PARTNER_ACCOUNT_ID = {pid}
+    ORDER BY ADDED_AT_IST DESC
+    LIMIT 100
+    """
+    try:
+        return run_sql(sql)
+    except Exception as e:
+        return None
+
+with st.spinner("Loading wallet transactions..."):
+    wallet_df = fetch_wallet_transactions(partner_id)
+
+if wallet_df is not None and len(wallet_df) > 0:
+    current_balance = safe_float(wallet_df.iloc[0]['BALANCE'])
+    total_credits = wallet_df[wallet_df['CREDIT_DELTA'].apply(safe_float) > 0]['CREDIT_DELTA'].apply(safe_float).sum()
+    total_debits  = abs(wallet_df[wallet_df['CREDIT_DELTA'].apply(safe_float) < 0]['CREDIT_DELTA'].apply(safe_float).sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Current Wallet Balance", f"₹{current_balance:,.2f}")
+    c2.metric("Credits (last 100)", f"₹{total_credits:,.0f}")
+    c3.metric("Withdrawals (last 100)", f"₹{total_debits:,.0f}")
+    c4.metric("Transactions Shown", len(wallet_df))
+
+    disp_wallet = wallet_df.copy()
+    disp_wallet['#'] = range(1, len(disp_wallet) + 1)
+    disp_wallet['Amount'] = disp_wallet['CREDIT_DELTA'].apply(
+        lambda x: f"+₹{safe_float(x):,.2f}" if safe_float(x) > 0 else f"-₹{abs(safe_float(x)):,.2f}" if safe_float(x) < 0 else "₹0"
+    )
+    disp_wallet['Balance After'] = disp_wallet['BALANCE'].apply(lambda x: f"₹{safe_float(x):,.2f}")
+    disp_wallet['Remark'] = disp_wallet['REMARK'].apply(lambda x: str(x)[:80] if x else '')
+    disp_wallet = disp_wallet[['#', 'ADDED_AT_IST', 'ACTION', 'Amount', 'Balance After', 'Remark']].rename(columns={
+        'ADDED_AT_IST': 'Date & Time (IST)',
+        'ACTION': 'Type',
+    })
+    st.dataframe(disp_wallet, use_container_width=True, height=420, hide_index=True)
+else:
+    st.info("No wallet transactions found for this partner.")
+
 # ── Raw Data ──────────────────────────────────────────────────────────────────
 with st.expander("📋 View All Partner Fields"):
     raw = pd.DataFrame([dict(row)]).T.rename(columns={0: 'Value'})
