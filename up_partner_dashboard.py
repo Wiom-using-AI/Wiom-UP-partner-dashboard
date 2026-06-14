@@ -809,7 +809,7 @@ def fetch_customer_data(pid):
     ),
     last_ping AS (
         SELECT pm.MOBILE,
-               MAX(u.DATE) AS LAST_PING_DATE
+               MAX(u.ADDED_DATE) AS LAST_PING_DATE
         FROM partner_mobiles pm
         JOIN PROD_DB.PUBLIC.CUSTOMER_DAILY_DATA_USAGE u ON u.NASID = pm.NAS_ID
         GROUP BY pm.MOBILE
