@@ -199,6 +199,45 @@ def fetch_live_tickets_m0(partner_id):
 
 
 @st.cache_data(ttl=3600)
+def fetch_live_sla_range(partner_id, start_date, end_date=None):
+    """Compute SLA from TICKETVANILLA_AUDIT: SLA met = ticket with no SLA breach event."""
+    end_clause = f"AND ADDED_TIME::TIMESTAMP < '{end_date}'" if end_date else ""
+    sql = f"""
+    WITH tickets AS (
+        SELECT TASK_ID, TYPE
+        FROM PUBLIC.TICKETVANILLA_AUDIT
+        WHERE ASSIGNED_ACCOUNT_ID = {partner_id}
+          AND EVENT_NAME = 'TICKET_CREATED'
+          AND ADDED_TIME::TIMESTAMP >= '{start_date}'
+          {end_clause}
+    ),
+    breached AS (
+        SELECT DISTINCT TASK_ID
+        FROM PUBLIC.TICKETVANILLA_AUDIT
+        WHERE EVENT_NAME ILIKE '%SLA%BREACH%'
+          AND TASK_ID IN (SELECT TASK_ID FROM tickets)
+    )
+    SELECT
+        t.TYPE,
+        COUNT(DISTINCT t.TASK_ID) AS total_tickets,
+        COUNT(DISTINCT CASE WHEN b.TASK_ID IS NULL THEN t.TASK_ID END) AS sla_met
+    FROM tickets t
+    LEFT JOIN breached b ON t.TASK_ID = b.TASK_ID
+    GROUP BY 1
+    """
+    try:
+        df = run_sql(sql)
+        if df is None or len(df) == 0:
+            return None
+        result = {}
+        for _, r in df.iterrows():
+            result[r['TYPE']] = (safe_int(r['TOTAL_TICKETS']), safe_int(r['SLA_MET']))
+        return result
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600)
 def fetch_active_base_all_months(partner_id):
     """
     Returns (m0, m1, m2, m3) active base from PARTNER_GROWTH_CARD_RAW pre-computed values.
@@ -368,23 +407,48 @@ def _best_sla(ticket_key, sla_key, pgc_data, pjk_data):
 svc_sla_pct, svc_m_lbl = _best_sla('service_ticket', 'service_ticket_sla', pgc, pjk)
 dev_sla_pct, dev_m_lbl = _best_sla('device_ticket', 'device_ticket_sla', pgc, pjk)
 
+# Try live current-month SLA from TICKETVANILLA (overrides growth card fallback)
+_m0_start = today.replace(day=1).strftime('%Y-%m-01')
+_m1_start = (today.replace(day=1) - relativedelta(months=1)).strftime('%Y-%m-01')
+
+live_sla_m0 = fetch_live_sla_range(partner_id, _m0_start)
+live_sla_m1 = fetch_live_sla_range(partner_id, _m1_start, _m0_start)
+
+def _apply_live_sla(ticket_type, live_m0, live_m1, cur_pct, cur_lbl):
+    """Override SLA with live TICKETVANILLA data if current month has tickets."""
+    for live_data, label in [(live_m0, f'{m0_label} MTD'), (live_m1, m1_label)]:
+        if live_data:
+            total, met = live_data.get(ticket_type, (0, 0))
+            if total > 0:
+                return met / total * 100, label
+    return cur_pct, cur_lbl
+
+svc_sla_pct, svc_m_lbl = _apply_live_sla('SERVICE',       live_sla_m0, live_sla_m1, svc_sla_pct, svc_m_lbl)
+dev_sla_pct, dev_m_lbl = _apply_live_sla('ROUTER_PICKUP', live_sla_m0, live_sla_m1, dev_sla_pct, dev_m_lbl)
+
+# Determine if showing stale (Apr) data
+_sla_stale = any(lbl in (m2_label, m3_label) for lbl in [svc_m_lbl, dev_m_lbl] if lbl)
+
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Zone", str(row.get('ZONE', '-')))
 c2.metric("Status", str(row.get('PARTNER_STATUS', '-')))
 c3.metric("Service Rating", f"{service_rating:.1f} ★" if service_rating else "N/A",
           help="Partner's average service rating from PARTNER_JANAM_KUNDLI")
-c4.metric(f"Device SLA ({dev_m_lbl})" if dev_m_lbl else "Device SLA",
-          f"{dev_sla_pct:.1f}%" if dev_sla_pct is not None else "N/A",
-          help="Most recent month with device tickets (SLA = tickets resolved on time / total)")
-c5.metric(f"Service SLA ({svc_m_lbl})" if svc_m_lbl else "Service SLA",
-          f"{svc_sla_pct:.1f}%" if svc_sla_pct is not None else "N/A",
-          help="Most recent month with service tickets (SLA = tickets resolved on time / total)")
+c4.metric(
+    f"Device SLA ({dev_m_lbl})" if dev_m_lbl and not _sla_stale else f"Device SLA (last: {dev_m_lbl})" if dev_m_lbl else "Device SLA",
+    f"{dev_sla_pct:.1f}%" if dev_sla_pct is not None else "N/A",
+    help="SLA = tickets resolved on time / total. 'last:' means current-month data not yet available."
+)
+c5.metric(
+    f"Service SLA ({svc_m_lbl})" if svc_m_lbl and not _sla_stale else f"Service SLA (last: {svc_m_lbl})" if svc_m_lbl else "Service SLA",
+    f"{svc_sla_pct:.1f}%" if svc_sla_pct is not None else "N/A",
+    help="SLA = tickets resolved on time / total. 'last:' means current-month data not yet available."
+)
 
-# Warn when falling back past M0 MTD — pipeline hasn't refreshed M1 yet
-if svc_m_lbl in (m2_label, m3_label) or dev_m_lbl in (m2_label, m3_label):
-    st.caption(f"ℹ️ SLA shows {m2_label} — {m1_label} data not yet available in the pipeline.")
-elif f'{m0_label} MTD' in (svc_m_lbl or '', dev_m_lbl or ''):
-    st.caption(f"ℹ️ SLA shows {m0_label} MTD — {m1_label} data not yet in pipeline; showing current month so far.")
+if _sla_stale:
+    st.warning(f"⚠️ Showing **{m2_label}** SLA (most recent available) — {m1_label} & {m0_label} data not yet loaded in the pipeline.", icon=None)
+elif any(f'{m0_label} MTD' == lbl for lbl in [svc_m_lbl, dev_m_lbl] if lbl):
+    st.caption(f"ℹ️ SLA is {m0_label} MTD (live) — {m1_label} pipeline data pending.")
 
 st.divider()
 
