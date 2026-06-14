@@ -169,9 +169,9 @@ def fetch_pjk_data(partner_id):
 
 
 @st.cache_data(ttl=3600)
-def fetch_live_tickets_m0(partner_id):
-    """Fetch current-month ticket counts from TICKETVANILLA_AUDIT (used when growth card m0 = 0)."""
-    m0_start = today.replace(day=1).strftime('%Y-%m-01')
+def fetch_live_tickets_range(partner_id, start_date, end_date=None):
+    """Fetch ticket counts from TICKETVANILLA_AUDIT for a date range."""
+    end_clause = f"AND ADDED_TIME::TIMESTAMP < '{end_date}'" if end_date else ""
     sql = f"""
     SELECT
         TYPE,
@@ -179,7 +179,8 @@ def fetch_live_tickets_m0(partner_id):
     FROM PUBLIC.TICKETVANILLA_AUDIT
     WHERE ASSIGNED_ACCOUNT_ID = {partner_id}
       AND EVENT_NAME = 'TICKET_CREATED'
-      AND ADDED_TIME::TIMESTAMP >= '{m0_start}'
+      AND ADDED_TIME::TIMESTAMP >= '{start_date}'
+      {end_clause}
     GROUP BY 1
     """
     try:
@@ -187,11 +188,14 @@ def fetch_live_tickets_m0(partner_id):
         if df is None or len(df) == 0:
             return 0, 0
         type_map = {r['TYPE']: safe_int(r['TICKETS']) for _, r in df.iterrows()}
-        svc = type_map.get('SERVICE', 0)
-        dev = type_map.get('ROUTER_PICKUP', 0)
-        return svc, dev
+        return type_map.get('SERVICE', 0), type_map.get('ROUTER_PICKUP', 0)
     except Exception:
         return 0, 0
+
+
+def fetch_live_tickets_m0(partner_id):
+    m0_start = today.replace(day=1).strftime('%Y-%m-01')
+    return fetch_live_tickets_range(partner_id, m0_start)
 
 
 @st.cache_data(ttl=3600)
@@ -610,13 +614,28 @@ if pgc is not None:
     dev_tickets = [safe_int(pgc.get(f'device_ticket_m{i}')) for i in [2, 1, 0]]
     dev_sla_cnt = [safe_int(pgc.get(f'device_ticket_sla_m{i}')) for i in [2, 1, 0]]
 
-    # If current month (m0) is 0 in growth card, pull live data from TICKETVANILLA_AUDIT
+    ticket_notes = []
+
+    # Backfill M1 (last complete month) from TICKETVANILLA if growth card shows 0
+    if svc_tickets[1] == 0 and dev_tickets[1] == 0:
+        m1_start = (today.replace(day=1) - relativedelta(months=1)).strftime('%Y-%m-01')
+        m0_start = today.replace(day=1).strftime('%Y-%m-01')
+        live_svc_m1, live_dev_m1 = fetch_live_tickets_range(partner_id, m1_start, m0_start)
+        if live_svc_m1 > 0 or live_dev_m1 > 0:
+            svc_tickets[1] = live_svc_m1
+            dev_tickets[1] = live_dev_m1
+            ticket_notes.append(f"**{m1_label}** pulled live from TICKETVANILLA (growth card not yet populated)")
+
+    # Backfill M0 (current month MTD) from TICKETVANILLA if growth card shows 0
     if svc_tickets[2] == 0 and dev_tickets[2] == 0:
         live_svc, live_dev = fetch_live_tickets_m0(partner_id)
         if live_svc > 0 or live_dev > 0:
             svc_tickets[2] = live_svc
             dev_tickets[2] = live_dev
-            st.caption(f"ℹ️ **{m0_label}** ticket counts are MTD (live from TICKETVANILLA · SLA calculated at month-end)")
+            ticket_notes.append(f"**{m0_label}** is MTD (live from TICKETVANILLA · SLA calculated at month-end)")
+
+    if ticket_notes:
+        st.caption("ℹ️ " + " · ".join(ticket_notes))
 
     c1, c2 = st.columns(2)
     with c1:
