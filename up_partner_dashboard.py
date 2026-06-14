@@ -784,7 +784,8 @@ def fetch_customer_data(pid):
                DATEADD('minute', 330, PLAN_START_TIME)                                              AS LAST_RECHARGE_IST,
                DATEADD('minute', 330, DATEADD('second', TIME_PLAN, PLAN_START_TIME))               AS PLAN_EXPIRY_IST,
                CHARGES,
-               ROUND(TIME_PLAN / 86400.0, 0)                                                       AS PLAN_DAYS
+               ROUND(TIME_PLAN / 86400.0, 0)                                                       AS PLAN_DAYS,
+               SPEED_MBPS
         FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
         WHERE LCO_ACCOUNT_ID = {pid}
         QUALIFY ROW_NUMBER() OVER (PARTITION BY MOBILE ORDER BY PLAN_START_TIME DESC) = 1
@@ -821,6 +822,11 @@ def fetch_customer_data(pid):
         lp.LAST_PING_DATE                                                                AS LAST_PING,
         cp.LAST_RECHARGE_IST                                                             AS LAST_RECHARGE,
         cp.PLAN_EXPIRY_IST                                                               AS PLAN_EXPIRY,
+        CONCAT_WS(' | ',
+            NULLIF(cp.SPEED_MBPS::STRING || ' Mbps', ' Mbps'),
+            NULLIF(cp.PLAN_DAYS::INT::STRING || 'd', 'd'),
+            NULLIF('Rs ' || cp.CHARGES::INT::STRING, 'Rs ')
+        )                                                                                AS PLAN_DETAILS,
         CASE
             WHEN cp.PLAN_EXPIRY_IST IS NULL THEN NULL
             WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN NULL
@@ -878,6 +884,7 @@ if cx_df is not None and len(cx_df) > 0:
     disp_cx['DAYS_SINCE_EXPIRY'] = disp_cx.apply(_fmt_expiry, axis=1)
     disp_cx['LAST_PING'] = disp_cx['LAST_PING'].apply(lambda x: str(x)[:10] if x else '—')
     disp_cx['ADDRESS'] = disp_cx['ADDRESS'].apply(lambda x: str(x)[:60] if x else '—')
+    disp_cx['PLAN_DETAILS'] = disp_cx['PLAN_DETAILS'].apply(lambda x: str(x) if x else '—')
 
     disp_cx = disp_cx.rename(columns={
         'MOBILE': 'Mobile',
@@ -886,12 +893,13 @@ if cx_df is not None and len(cx_df) > 0:
         'LAST_PING': 'Last Ping',
         'LAST_RECHARGE': 'Last Recharge',
         'PLAN_EXPIRY': 'Plan Expiry',
+        'PLAN_DETAILS': 'Plan',
         'DAYS_SINCE_EXPIRY': 'Since Expiry',
         'STATUS': 'Status',
     })
 
     st.dataframe(
-        disp_cx[['Mobile', 'Name', 'Address', 'Last Ping', 'Last Recharge', 'Plan Expiry', 'Since Expiry', 'Status']],
+        disp_cx[['Mobile', 'Name', 'Address', 'Last Ping', 'Last Recharge', 'Plan Expiry', 'Plan', 'Since Expiry', 'Status']],
         use_container_width=True,
         hide_index=True
     )
