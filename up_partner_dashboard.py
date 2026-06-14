@@ -830,14 +830,6 @@ def fetch_customer_data(pid):
           AND CHARGES > 0
         GROUP BY MOBILE
     ),
-    data_7d AS (
-        SELECT pm.MOBILE,
-               ROUND(SUM(u.UPLOAD + u.DOWNLOAD) / 1024.0, 1) AS DATA_7D_GB
-        FROM partner_mobiles pm
-        JOIN PROD_DB.PUBLIC.CUSTOMER_DAILY_DATA_USAGE u ON u.NASID = pm.NAS_ID
-        WHERE u.ADDED_DATE >= DATEADD('day', -7, CURRENT_DATE)
-        GROUP BY pm.MOBILE
-    )
     SELECT
         pm.MOBILE,
         COALESCE(cx.CUSTOMER_NAME, pm.MOBILE)                                           AS NAME,
@@ -852,7 +844,6 @@ def fetch_customer_data(pid):
             NULLIF(cp.PLAN_DAYS::INT::STRING || 'd', 'd'),
             NULLIF('Rs ' || cp.CHARGES::INT::STRING, 'Rs ')
         )                                                                                AS PLAN_DETAILS,
-        COALESCE(d7.DATA_7D_GB, 0)                                                       AS DATA_7D_GB,
         CASE
             WHEN cp.PLAN_EXPIRY_IST IS NULL THEN NULL
             WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN NULL
@@ -870,7 +861,6 @@ def fetch_customer_data(pid):
     LEFT JOIN last_ping      lp ON lp.MOBILE = pm.MOBILE
     LEFT JOIN install_date   id ON id.MOBILE = pm.MOBILE
     LEFT JOIN recharge_count rc ON rc.MOBILE = pm.MOBILE
-    LEFT JOIN data_7d        d7 ON d7.MOBILE = pm.MOBILE
     ORDER BY
         CASE WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN 0 ELSE 1 END,
         cp.PLAN_EXPIRY_IST DESC NULLS LAST
@@ -916,9 +906,6 @@ if cx_df is not None and len(cx_df) > 0:
     disp_cx['PLAN_DETAILS'] = disp_cx['PLAN_DETAILS'].apply(lambda x: str(x) if x else '—')
     disp_cx['INSTALL_DATE'] = disp_cx['INSTALL_DATE'].apply(lambda x: str(x)[:10] if x else '—')
     disp_cx['RECHARGE_COUNT'] = disp_cx['RECHARGE_COUNT'].apply(lambda x: safe_int(x) if x else 0)
-    disp_cx['DATA_7D_GB'] = disp_cx['DATA_7D_GB'].apply(
-        lambda x: f"{float(x):.1f} GB" if x and float(x) > 0 else '—'
-    )
 
     disp_cx = disp_cx.rename(columns={
         'MOBILE': 'Mobile',
@@ -930,14 +917,13 @@ if cx_df is not None and len(cx_df) > 0:
         'RECHARGE_COUNT': 'Recharges',
         'PLAN_EXPIRY': 'Plan Expiry',
         'PLAN_DETAILS': 'Plan',
-        'DATA_7D_GB': 'Data (7d)',
         'DAYS_SINCE_EXPIRY': 'Since Expiry',
         'STATUS': 'Status',
     })
 
     st.dataframe(
         disp_cx[['Mobile', 'Name', 'Address', 'Installed On', 'Last Ping', 'Last Recharge',
-                 'Recharges', 'Plan Expiry', 'Plan', 'Data (7d)', 'Since Expiry', 'Status']],
+                 'Recharges', 'Plan Expiry', 'Plan', 'Since Expiry', 'Status']],
         use_container_width=True,
         hide_index=True
     )
