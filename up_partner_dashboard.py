@@ -726,7 +726,7 @@ if wallet_df is not None and len(wallet_df) > 0:
         'ADDED_AT_IST': 'Date & Time (IST)',
         'ACTION': 'Type',
     })
-    st.dataframe(disp_wallet, use_container_width=True, height=420, hide_index=True)
+    st.dataframe(disp_wallet, use_container_width=True, hide_index=True)
 else:
     st.info("No wallet transactions found for this partner.")
 
