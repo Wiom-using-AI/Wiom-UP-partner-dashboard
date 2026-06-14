@@ -814,19 +814,45 @@ def fetch_customer_data(pid):
         FROM partner_mobiles pm
         JOIN PROD_DB.PUBLIC.CUSTOMER_DAILY_DATA_USAGE u ON u.NASID = pm.NAS_ID
         GROUP BY pm.MOBILE
+    ),
+    install_date AS (
+        SELECT MOBILE,
+               TO_DATE(DATEADD('minute', 330, MIN(ADDED_TIME))) AS INSTALL_DATE
+        FROM PROD_DB.PUBLIC.TASK_LOGS
+        WHERE MOBILE IN (SELECT MOBILE FROM partner_mobiles)
+          AND EVENT_NAME = 'OTP_VERIFIED'
+        GROUP BY MOBILE
+    ),
+    recharge_count AS (
+        SELECT MOBILE, COUNT(*) AS RECHARGE_COUNT
+        FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
+        WHERE LCO_ACCOUNT_ID = {pid}
+          AND CHARGES > 0
+        GROUP BY MOBILE
+    ),
+    data_7d AS (
+        SELECT pm.MOBILE,
+               ROUND(SUM(u.UPLOAD + u.DOWNLOAD) / 1024.0, 1) AS DATA_7D_GB
+        FROM partner_mobiles pm
+        JOIN PROD_DB.PUBLIC.CUSTOMER_DAILY_DATA_USAGE u ON u.NASID = pm.NAS_ID
+        WHERE u.ADDED_DATE >= DATEADD('day', -7, CURRENT_DATE)
+        GROUP BY pm.MOBILE
     )
     SELECT
         pm.MOBILE,
         COALESCE(cx.CUSTOMER_NAME, pm.MOBILE)                                           AS NAME,
         ai.ADDRESS,
+        id.INSTALL_DATE                                                                  AS INSTALL_DATE,
         lp.LAST_PING_DATE                                                                AS LAST_PING,
         cp.LAST_RECHARGE_IST                                                             AS LAST_RECHARGE,
+        COALESCE(rc.RECHARGE_COUNT, 0)                                                   AS RECHARGE_COUNT,
         cp.PLAN_EXPIRY_IST                                                               AS PLAN_EXPIRY,
         CONCAT_WS(' | ',
             NULLIF(cp.SPEED_MBPS::STRING || ' Mbps', ' Mbps'),
             NULLIF(cp.PLAN_DAYS::INT::STRING || 'd', 'd'),
             NULLIF('Rs ' || cp.CHARGES::INT::STRING, 'Rs ')
         )                                                                                AS PLAN_DETAILS,
+        COALESCE(d7.DATA_7D_GB, 0)                                                       AS DATA_7D_GB,
         CASE
             WHEN cp.PLAN_EXPIRY_IST IS NULL THEN NULL
             WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN NULL
@@ -838,10 +864,13 @@ def fetch_customer_data(pid):
             ELSE 'Expired'
         END                                                                              AS STATUS
     FROM partner_mobiles pm
-    LEFT JOIN cx_info   cx ON cx.MOBILE = pm.MOBILE
-    LEFT JOIN addr_info ai ON ai.MOBILE = pm.MOBILE
-    LEFT JOIN current_plan cp ON cp.MOBILE = pm.MOBILE
-    LEFT JOIN last_ping lp ON lp.MOBILE = pm.MOBILE
+    LEFT JOIN cx_info        cx ON cx.MOBILE = pm.MOBILE
+    LEFT JOIN addr_info      ai ON ai.MOBILE = pm.MOBILE
+    LEFT JOIN current_plan   cp ON cp.MOBILE = pm.MOBILE
+    LEFT JOIN last_ping      lp ON lp.MOBILE = pm.MOBILE
+    LEFT JOIN install_date   id ON id.MOBILE = pm.MOBILE
+    LEFT JOIN recharge_count rc ON rc.MOBILE = pm.MOBILE
+    LEFT JOIN data_7d        d7 ON d7.MOBILE = pm.MOBILE
     ORDER BY
         CASE WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN 0 ELSE 1 END,
         cp.PLAN_EXPIRY_IST DESC NULLS LAST
@@ -885,21 +914,30 @@ if cx_df is not None and len(cx_df) > 0:
     disp_cx['LAST_PING'] = disp_cx['LAST_PING'].apply(lambda x: str(x)[:10] if x else '—')
     disp_cx['ADDRESS'] = disp_cx['ADDRESS'].apply(lambda x: str(x)[:60] if x else '—')
     disp_cx['PLAN_DETAILS'] = disp_cx['PLAN_DETAILS'].apply(lambda x: str(x) if x else '—')
+    disp_cx['INSTALL_DATE'] = disp_cx['INSTALL_DATE'].apply(lambda x: str(x)[:10] if x else '—')
+    disp_cx['RECHARGE_COUNT'] = disp_cx['RECHARGE_COUNT'].apply(lambda x: safe_int(x) if x else 0)
+    disp_cx['DATA_7D_GB'] = disp_cx['DATA_7D_GB'].apply(
+        lambda x: f"{float(x):.1f} GB" if x and float(x) > 0 else '—'
+    )
 
     disp_cx = disp_cx.rename(columns={
         'MOBILE': 'Mobile',
         'NAME': 'Name',
         'ADDRESS': 'Address',
+        'INSTALL_DATE': 'Installed On',
         'LAST_PING': 'Last Ping',
         'LAST_RECHARGE': 'Last Recharge',
+        'RECHARGE_COUNT': 'Recharges',
         'PLAN_EXPIRY': 'Plan Expiry',
         'PLAN_DETAILS': 'Plan',
+        'DATA_7D_GB': 'Data (7d)',
         'DAYS_SINCE_EXPIRY': 'Since Expiry',
         'STATUS': 'Status',
     })
 
     st.dataframe(
-        disp_cx[['Mobile', 'Name', 'Address', 'Last Ping', 'Last Recharge', 'Plan Expiry', 'Plan', 'Since Expiry', 'Status']],
+        disp_cx[['Mobile', 'Name', 'Address', 'Installed On', 'Last Ping', 'Last Recharge',
+                 'Recharges', 'Plan Expiry', 'Plan', 'Data (7d)', 'Since Expiry', 'Status']],
         use_container_width=True,
         hide_index=True
     )
