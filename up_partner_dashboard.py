@@ -767,6 +767,139 @@ else:
 
 st.divider()
 
+# ── Customer Data ─────────────────────────────────────────────────────────────
+st.subheader("👤 All Customers")
+
+@st.cache_data(ttl=3600)
+def fetch_customer_data(pid):
+    sql = f"""
+    WITH partner_mobiles AS (
+        SELECT DISTINCT MOBILE, MAX(NAS_ID) AS NAS_ID
+        FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
+        WHERE LCO_ACCOUNT_ID = {pid}
+        GROUP BY MOBILE
+    ),
+    current_plan AS (
+        SELECT MOBILE,
+               DATEADD('minute', 330, PLAN_START_TIME)                                              AS LAST_RECHARGE_IST,
+               DATEADD('minute', 330, DATEADD('second', TIME_PLAN, PLAN_START_TIME))               AS PLAN_EXPIRY_IST,
+               CHARGES,
+               ROUND(TIME_PLAN / 86400.0, 0)                                                       AS PLAN_DAYS
+        FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
+        WHERE LCO_ACCOUNT_ID = {pid}
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY MOBILE ORDER BY PLAN_START_TIME DESC) = 1
+    ),
+    cx_info AS (
+        SELECT b.MOBILE, b.NAME AS CUSTOMER_NAME
+        FROM PROD_DB.DYNAMODB_READ.BOOKING b
+        WHERE b.MOBILE IN (SELECT MOBILE FROM partner_mobiles)
+          AND b._FIVETRAN_DELETED = FALSE
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY b.MOBILE ORDER BY b._FIVETRAN_START DESC) = 1
+    ),
+    addr_info AS (
+        SELECT bl.MOBILE,
+               CONCAT_WS(', ',
+                   NULLIF(TRY_PARSE_JSON(TRY_PARSE_JSON(bl.DATA):address::STRING):home::STRING, ''),
+                   NULLIF(TRY_PARSE_JSON(TRY_PARSE_JSON(bl.DATA):address::STRING):city::STRING, '')
+               ) AS ADDRESS
+        FROM PROD_DB.PUBLIC.BOOKING_LOGS bl
+        WHERE bl.MOBILE IN (SELECT MOBILE FROM partner_mobiles)
+          AND bl.EVENT_NAME = 'address_updated'
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY bl.MOBILE ORDER BY bl.ADDED_TIME DESC) = 1
+    ),
+    last_ping AS (
+        SELECT pm.MOBILE,
+               MAX(u.DATE) AS LAST_PING_DATE
+        FROM partner_mobiles pm
+        JOIN PROD_DB.PUBLIC.CUSTOMER_DAILY_DATA_USAGE u ON u.NASID = pm.NAS_ID
+        GROUP BY pm.MOBILE
+    )
+    SELECT
+        pm.MOBILE,
+        COALESCE(cx.CUSTOMER_NAME, pm.MOBILE)                                           AS NAME,
+        ai.ADDRESS,
+        lp.LAST_PING_DATE                                                                AS LAST_PING,
+        cp.LAST_RECHARGE_IST                                                             AS LAST_RECHARGE,
+        cp.PLAN_EXPIRY_IST                                                               AS PLAN_EXPIRY,
+        CASE
+            WHEN cp.PLAN_EXPIRY_IST IS NULL THEN NULL
+            WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN NULL
+            ELSE DATEDIFF('day', cp.PLAN_EXPIRY_IST::DATE, CURRENT_DATE)
+        END                                                                              AS DAYS_SINCE_EXPIRY,
+        CASE
+            WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN 'Active'
+            WHEN cp.PLAN_EXPIRY_IST IS NULL THEN 'No Plan'
+            ELSE 'Expired'
+        END                                                                              AS STATUS
+    FROM partner_mobiles pm
+    LEFT JOIN cx_info   cx ON cx.MOBILE = pm.MOBILE
+    LEFT JOIN addr_info ai ON ai.MOBILE = pm.MOBILE
+    LEFT JOIN current_plan cp ON cp.MOBILE = pm.MOBILE
+    LEFT JOIN last_ping lp ON lp.MOBILE = pm.MOBILE
+    ORDER BY
+        CASE WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN 0 ELSE 1 END,
+        cp.PLAN_EXPIRY_IST DESC NULLS LAST
+    """
+    return run_sql(sql)
+
+with st.spinner("Loading customer data..."):
+    try:
+        cx_df = fetch_customer_data(partner_id)
+    except Exception as e:
+        cx_df = None
+        st.error(f"Could not load customer data: {e}")
+
+if cx_df is not None and len(cx_df) > 0:
+    total_cx   = len(cx_df)
+    active_cx  = len(cx_df[cx_df['STATUS'] == 'Active'])
+    expired_cx = len(cx_df[cx_df['STATUS'] == 'Expired'])
+    no_plan_cx = len(cx_df[cx_df['STATUS'] == 'No Plan'])
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Customers", total_cx)
+    c2.metric("Active", active_cx)
+    c3.metric("Expired", expired_cx)
+    c4.metric("No Plan", no_plan_cx)
+
+    disp_cx = cx_df.copy()
+    disp_cx['LAST_RECHARGE'] = disp_cx['LAST_RECHARGE'].apply(
+        lambda x: str(x)[:16] if x else '—'
+    )
+    disp_cx['PLAN_EXPIRY'] = disp_cx['PLAN_EXPIRY'].apply(
+        lambda x: str(x)[:16] if x else '—'
+    )
+    def _fmt_expiry(row):
+        if row['STATUS'] == 'Active':
+            return 'Active ✓'
+        v = row['DAYS_SINCE_EXPIRY']
+        if v is None or str(v) in ('None', ''):
+            return '—'
+        return f"{safe_int(v)}d ago"
+    disp_cx['DAYS_SINCE_EXPIRY'] = disp_cx.apply(_fmt_expiry, axis=1)
+    disp_cx['LAST_PING'] = disp_cx['LAST_PING'].apply(lambda x: str(x)[:10] if x else '—')
+    disp_cx['ADDRESS'] = disp_cx['ADDRESS'].apply(lambda x: str(x)[:60] if x else '—')
+
+    disp_cx = disp_cx.rename(columns={
+        'MOBILE': 'Mobile',
+        'NAME': 'Name',
+        'ADDRESS': 'Address',
+        'LAST_PING': 'Last Ping',
+        'LAST_RECHARGE': 'Last Recharge',
+        'PLAN_EXPIRY': 'Plan Expiry',
+        'DAYS_SINCE_EXPIRY': 'Since Expiry',
+        'STATUS': 'Status',
+    })
+
+    st.dataframe(
+        disp_cx[['Mobile', 'Name', 'Address', 'Last Ping', 'Last Recharge', 'Plan Expiry', 'Since Expiry', 'Status']],
+        use_container_width=True,
+        hide_index=True
+    )
+elif cx_df is not None:
+    st.info("No customer data found for this partner.")
+
+st.divider()
+
 # ── Wallet Transactions ───────────────────────────────────────────────────────
 st.subheader("💳 Wallet Transactions (Last 100)")
 
