@@ -794,7 +794,7 @@ def fetch_customer_data(pid):
         FROM PROD_DB.DYNAMODB_READ.BOOKING b
         WHERE b.MOBILE IN (SELECT MOBILE FROM partner_mobiles)
           AND b._FIVETRAN_DELETED = FALSE
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY b.MOBILE) = 1
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY b.MOBILE ORDER BY b.MOBILE) = 1
     ),
     addr_info AS (
         SELECT bl.MOBILE,
