@@ -829,7 +829,7 @@ def fetch_customer_data(pid):
         WHERE LCO_ACCOUNT_ID = {pid}
           AND CHARGES > 0
         GROUP BY MOBILE
-    ),
+    )
     SELECT
         pm.MOBILE,
         COALESCE(cx.CUSTOMER_NAME, pm.MOBILE)                                           AS NAME,
