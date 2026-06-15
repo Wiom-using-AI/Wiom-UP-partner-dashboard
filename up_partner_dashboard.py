@@ -200,8 +200,13 @@ def fetch_live_tickets_m0(partner_id):
 
 @st.cache_data(ttl=3600)
 def fetch_live_sla_range(partner_id, start_date, end_date=None):
-    """Compute SLA from TICKETVANILLA_AUDIT: SLA met = ticket with no SLA breach event."""
+    """Compute SLA from TICKETVANILLA_AUDIT.
+    SLA met = ticket got ROUTER_RECOVERED/TICKET_CLOSED/TICKET_RESOLVED/CUSTOMER_RECOVERED
+    within the same window. SEND_TO_WIOM means partner escalated = SLA not met.
+    There is no SLA breach event in the audit table; resolution event presence is the signal.
+    """
     end_clause = f"AND ADDED_TIME::TIMESTAMP < '{end_date}'" if end_date else ""
+    res_end_clause = f"AND ADDED_TIME::TIMESTAMP < '{end_date}'" if end_date else ""
     sql = f"""
     WITH tickets AS (
         SELECT TASK_ID, TYPE
@@ -211,18 +216,19 @@ def fetch_live_sla_range(partner_id, start_date, end_date=None):
           AND ADDED_TIME::TIMESTAMP >= '{start_date}'
           {end_clause}
     ),
-    breached AS (
+    resolved AS (
         SELECT DISTINCT TASK_ID
         FROM PUBLIC.TICKETVANILLA_AUDIT
-        WHERE EVENT_NAME ILIKE '%SLA%BREACH%'
-          AND TASK_ID IN (SELECT TASK_ID FROM tickets)
+        WHERE TASK_ID IN (SELECT TASK_ID FROM tickets)
+          AND EVENT_NAME IN ('TICKET_RESOLVED', 'TICKET_CLOSED', 'ROUTER_RECOVERED', 'CUSTOMER_RECOVERED')
+          {res_end_clause}
     )
     SELECT
         t.TYPE,
-        COUNT(DISTINCT t.TASK_ID) AS total_tickets,
-        COUNT(DISTINCT CASE WHEN b.TASK_ID IS NULL THEN t.TASK_ID END) AS sla_met
+        COUNT(DISTINCT t.TASK_ID)  AS total_tickets,
+        COUNT(DISTINCT r.TASK_ID)  AS sla_met
     FROM tickets t
-    LEFT JOIN breached b ON t.TASK_ID = b.TASK_ID
+    LEFT JOIN resolved r ON t.TASK_ID = r.TASK_ID
     GROUP BY 1
     """
     try:
