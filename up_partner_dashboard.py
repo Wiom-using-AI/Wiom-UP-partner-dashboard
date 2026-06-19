@@ -13,18 +13,46 @@ from datetime import date, datetime
 from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
 
-load_dotenv(r'C:\credentials\.env')
-
-API_KEY = os.getenv('METABASE_API_KEY')
-if not API_KEY:
+def _load_credentials():
+    """Resolve METABASE_API_KEY from (in priority order):
+    1. An already-set environment variable (works in cloud / CI / containers).
+    2. A .env file pointed to by DOTENV_PATH.
+    3. A .env next to this script, then the default local Windows path.
+    The env var always wins, so deployments never depend on a hardcoded path.
+    """
     from pathlib import Path
-    env_path = Path(r'C:\credentials\.env')
-    if env_path.exists():
+
+    # 1. Already provided via the environment — nothing else to do.
+    if os.getenv('METABASE_API_KEY'):
+        return os.getenv('METABASE_API_KEY')
+
+    # 2/3. Search candidate .env locations.
+    candidates = [
+        os.getenv('DOTENV_PATH'),
+        Path(__file__).resolve().parent / '.env',
+        r'C:\credentials\.env',
+    ]
+    for cand in candidates:
+        if not cand:
+            continue
+        env_path = Path(cand)
+        if not env_path.exists():
+            continue
+        load_dotenv(env_path)
+        if os.getenv('METABASE_API_KEY'):
+            break
+        # Fallback manual parse for unusual .env formatting.
         for line in env_path.read_text().splitlines():
             if '=' in line and not line.startswith('#'):
                 k, v = line.split('=', 1)
                 os.environ.setdefault(k.strip(), v.strip())
-    API_KEY = os.getenv('METABASE_API_KEY')
+        if os.getenv('METABASE_API_KEY'):
+            break
+
+    return os.getenv('METABASE_API_KEY')
+
+
+API_KEY = _load_credentials()
 
 BASE_URL = 'https://metabase.wiom.in'
 DB_ID    = 113
@@ -55,7 +83,10 @@ if time.time() - st.session_state.last_refresh > REFRESH_INTERVAL_S:
 
 def run_sql(sql):
     if not API_KEY:
-        raise RuntimeError("METABASE_API_KEY not set — add it to C:\\credentials\\.env")
+        raise RuntimeError(
+            "METABASE_API_KEY not set — export it as an environment variable, "
+            "or put it in a .env file (set DOTENV_PATH, or place .env next to this script)."
+        )
     payload = {'database': DB_ID, 'type': 'native', 'native': {'query': sql}}
     r = requests.post(f"{BASE_URL}/api/dataset", headers=HEADERS, json=payload, timeout=300)
     data = r.json()
