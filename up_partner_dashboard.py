@@ -939,14 +939,6 @@ elif cx_df is not None:
 st.divider()
 
 # ── Wallet Transactions ───────────────────────────────────────────────────────
-w_col1, w_col2 = st.columns([8, 1])
-with w_col1:
-    st.subheader("💳 Wallet Transactions (Last 100)")
-with w_col2:
-    if st.button("🔄", key="refresh_wallet", help="Refresh wallet data"):
-        fetch_wallet_transactions.clear()
-        st.rerun()
-
 @st.cache_data(ttl=1800)
 def fetch_wallet_transactions(pid):
     sql = f"""
@@ -957,6 +949,14 @@ def fetch_wallet_transactions(pid):
     LIMIT 100
     """
     return run_sql(sql)
+
+w_col1, w_col2 = st.columns([8, 1])
+with w_col1:
+    st.subheader("💳 Wallet Transactions (Last 100)")
+with w_col2:
+    if st.button("🔄", key="refresh_wallet", help="Refresh wallet data"):
+        fetch_wallet_transactions.clear()
+        st.rerun()
 
 with st.spinner("Loading wallet transactions..."):
     try:
