@@ -939,7 +939,13 @@ elif cx_df is not None:
 st.divider()
 
 # ── Wallet Transactions ───────────────────────────────────────────────────────
-st.subheader("💳 Wallet Transactions (Last 100)")
+w_col1, w_col2 = st.columns([8, 1])
+with w_col1:
+    st.subheader("💳 Wallet Transactions (Last 100)")
+with w_col2:
+    if st.button("🔄", key="refresh_wallet", help="Refresh wallet data"):
+        fetch_wallet_transactions.clear()
+        st.rerun()
 
 @st.cache_data(ttl=1800)
 def fetch_wallet_transactions(pid):
@@ -950,13 +956,15 @@ def fetch_wallet_transactions(pid):
     ORDER BY ADDED_AT_IST DESC
     LIMIT 100
     """
-    try:
-        return run_sql(sql)
-    except Exception as e:
-        return None
+    return run_sql(sql)
 
 with st.spinner("Loading wallet transactions..."):
-    wallet_df = fetch_wallet_transactions(partner_id)
+    try:
+        wallet_df = fetch_wallet_transactions(partner_id)
+        wallet_err = None
+    except Exception as e:
+        wallet_df = None
+        wallet_err = str(e)
 
 if wallet_df is not None and len(wallet_df) > 0:
     current_balance = safe_float(wallet_df.iloc[0]['BALANCE'])
@@ -981,6 +989,8 @@ if wallet_df is not None and len(wallet_df) > 0:
         'ACTION': 'Type',
     })
     st.dataframe(disp_wallet, use_container_width=True, hide_index=True)
+elif wallet_err:
+    st.error(f"Wallet query failed: {wallet_err}")
 else:
     st.info("No wallet transactions found for this partner.")
 
