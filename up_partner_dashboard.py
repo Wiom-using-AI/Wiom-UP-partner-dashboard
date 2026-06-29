@@ -941,10 +941,25 @@ st.divider()
 # ── Wallet Transactions ───────────────────────────────────────────────────────
 @st.cache_data(ttl=1800)
 def fetch_wallet_transactions(pid):
+    # Pre-Jun-18 data from old table + post-migration data from new table
     sql = f"""
-    SELECT ACTION, REMARK, CREDIT_DELTA, BALANCE, ADDED_AT_IST
+    SELECT ACTION, REMARK, CREDIT_DELTA, BALANCE, ADDED_AT_IST::VARCHAR AS ADDED_AT_IST
     FROM PROD_DB.DBT_CSP.STG_CSP_BALANCE_SHEET
     WHERE PARTNER_ACCOUNT_ID = {pid}
+    UNION ALL
+    SELECT
+        ACTION,
+        REMARK,
+        (BALANCE - OLD_BALANCE)                                      AS CREDIT_DELTA,
+        BALANCE,
+        CONVERT_TIMEZONE('Asia/Kolkata', ADDED_TIME)::VARCHAR        AS ADDED_AT_IST
+    FROM PUBLIC.T_ACCOUNT_BALANCE_SHEET1_NEW
+    WHERE PARTNER_ID = {pid}
+      AND ADDED_TIME > (
+          SELECT COALESCE(MAX(ADDED_AT_IST), '2000-01-01')
+          FROM PROD_DB.DBT_CSP.STG_CSP_BALANCE_SHEET
+          WHERE PARTNER_ACCOUNT_ID = {pid}
+      )
     ORDER BY ADDED_AT_IST DESC
     LIMIT 100
     """
