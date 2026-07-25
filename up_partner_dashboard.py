@@ -353,6 +353,45 @@ def fetch_fixed_payout_monthly_bulk(partner_ids):
 
 
 @st.cache_data(ttl=86400)
+def fetch_device_counts_bulk():
+    """
+    ONT (device) count per partner, split by where the device currently sits.
+    Uses the SAME source table as the Metabase question 'Device Details End To End -
+    Execution' (card 9457): PROD_DB.PUBLIC.WIOM_DEVICE_DATA, keyed by PARTNER_ID.
+      - WITH_PARTNER          = device not yet linked to any customer (partner stock)
+      - WITH_ACTIVE_CUSTOMER  = linked to a customer who has not churned
+      - WITH_CHURNED_CUSTOMER = linked to a customer who has churned (USER_CHURN_DATE set)
+    Returns dict: {partner_id: {'WITH_PARTNER': n, 'WITH_ACTIVE_CUSTOMER': n, 'WITH_CHURNED_CUSTOMER': n}}
+    """
+    sql = """
+    SELECT
+        PARTNER_ID,
+        SUM(CASE WHEN CUSTOMER_ID IS NULL THEN 1 ELSE 0 END)
+            AS WITH_PARTNER,
+        SUM(CASE WHEN CUSTOMER_ID IS NOT NULL AND USER_CHURN_DATE IS NULL THEN 1 ELSE 0 END)
+            AS WITH_ACTIVE_CUSTOMER,
+        SUM(CASE WHEN CUSTOMER_ID IS NOT NULL AND USER_CHURN_DATE IS NOT NULL THEN 1 ELSE 0 END)
+            AS WITH_CHURNED_CUSTOMER
+    FROM PROD_DB.PUBLIC.WIOM_DEVICE_DATA
+    WHERE PARTNER_ID IS NOT NULL
+    GROUP BY PARTNER_ID
+    """
+    try:
+        df = run_sql(sql)
+    except Exception:
+        return {}
+    out = {}
+    for _, r in df.iterrows():
+        pid = safe_int(r['PARTNER_ID'])
+        out[pid] = {
+            'WITH_PARTNER': safe_int(r['WITH_PARTNER']),
+            'WITH_ACTIVE_CUSTOMER': safe_int(r['WITH_ACTIVE_CUSTOMER']),
+            'WITH_CHURNED_CUSTOMER': safe_int(r['WITH_CHURNED_CUSTOMER']),
+        }
+    return out
+
+
+@st.cache_data(ttl=86400)
 def fetch_rohit_earnings(partner_id):
     dec_start = (today.replace(day=1) - relativedelta(months=3)).strftime('%Y-%m-01')
     sql = f"""
@@ -417,6 +456,8 @@ if not selected_name:
     all_ids = all_df['PARTNER_ACCOUNT_ID'].dropna().apply(safe_int).tolist()
     with st.spinner("Correcting payout totals (fixed-payout fallback)..."):
         fixed_bulk = fetch_fixed_payout_monthly_bulk(all_ids)
+    with st.spinner("Loading ONT counts..."):
+        device_counts = fetch_device_counts_bulk()
 
     def _corrected_totals(r):
         pid = safe_int(r.get('PARTNER_ACCOUNT_ID'))
@@ -427,20 +468,30 @@ if not selected_name:
             if card_fixed_v == 0:
                 total_v += fixed_bulk.get((pid, key), 0)
             out[f'CORR_M{2 - i}_PAYOUT'] = total_v
+        dc = device_counts.get(pid, {})
+        out['ONT_WITH_PARTNER'] = dc.get('WITH_PARTNER', 0)
+        out['ONT_WITH_ACTIVE'] = dc.get('WITH_ACTIVE_CUSTOMER', 0)
+        out['ONT_WITH_CHURNED'] = dc.get('WITH_CHURNED_CUSTOMER', 0)
         return pd.Series(out)
 
     corrections = all_df.apply(_corrected_totals, axis=1)
     all_df = pd.concat([all_df, corrections], axis=1)
 
     disp = all_df[['PARTNER_NAME', 'ZONE', 'ACTIVE_BASE', 'PARTNER_STATUS',
-                    'LIFETIME_EARNING', 'CORR_M0_PAYOUT', 'CORR_M1_PAYOUT']].copy()
+                    'LIFETIME_EARNING', 'CORR_M0_PAYOUT', 'CORR_M1_PAYOUT',
+                    'ONT_WITH_PARTNER', 'ONT_WITH_ACTIVE', 'ONT_WITH_CHURNED']].copy()
     disp['LIFETIME_EARNING'] = disp['LIFETIME_EARNING'].apply(lambda x: f"₹{safe_float(x):,.0f}")
     disp['CORR_M0_PAYOUT']   = disp['CORR_M0_PAYOUT'].apply(lambda x: f"₹{safe_float(x):,.0f}")
     disp['CORR_M1_PAYOUT']   = disp['CORR_M1_PAYOUT'].apply(lambda x: f"₹{safe_float(x):,.0f}")
+    disp['ONT_WITH_PARTNER'] = disp['ONT_WITH_PARTNER'].apply(safe_int)
+    disp['ONT_WITH_ACTIVE']  = disp['ONT_WITH_ACTIVE'].apply(safe_int)
+    disp['ONT_WITH_CHURNED'] = disp['ONT_WITH_CHURNED'].apply(safe_int)
     disp = disp.sort_values('ACTIVE_BASE', ascending=False).rename(columns={
         'PARTNER_NAME': 'Partner', 'ZONE': 'Zone', 'ACTIVE_BASE': 'Active Base',
         'PARTNER_STATUS': 'Status', 'LIFETIME_EARNING': 'Lifetime Earning',
-        'CORR_M0_PAYOUT': f'{m0_label} Payout', 'CORR_M1_PAYOUT': f'{m1_label} Payout'
+        'CORR_M0_PAYOUT': f'{m0_label} Payout', 'CORR_M1_PAYOUT': f'{m1_label} Payout',
+        'ONT_WITH_PARTNER': 'ONT w/ Partner', 'ONT_WITH_ACTIVE': 'ONT w/ Active Cust',
+        'ONT_WITH_CHURNED': 'ONT w/ Churned Cust'
     })
     st.dataframe(disp, use_container_width=True, height=500, hide_index=True)
     st.stop()
@@ -460,6 +511,15 @@ try:
     pjk = fetch_pjk_data(partner_id)
 except Exception:
     pjk = {}
+
+# ONT counts for this partner (same source as Quick Overview)
+try:
+    _dc = fetch_device_counts_bulk().get(partner_id, {})
+except Exception:
+    _dc = {}
+ont_with_partner = _dc.get('WITH_PARTNER', 0)
+ont_with_active = _dc.get('WITH_ACTIVE_CUSTOMER', 0)
+ont_with_churned = _dc.get('WITH_CHURNED_CUSTOMER', 0)
 
 # ── Partner Header ─────────────────────────────────────────────────────────────
 # Rating: use SERVICE_RATING from PARTNER_JANAM_KUNDLI (actual partner rating score)
@@ -525,6 +585,12 @@ c5.metric(
     f"{svc_sla_pct:.1f}%" if svc_sla_pct is not None else "N/A",
     help="SLA = tickets resolved on time / total. 'last:' means current-month data not yet available."
 )
+
+st.caption("📦 **ONT (device) counts** — from PROD_DB.PUBLIC.WIOM_DEVICE_DATA (same source as Metabase card 9457)")
+d1, d2, d3 = st.columns(3)
+d1.metric("ONT w/ Partner", ont_with_partner, help="Devices not yet linked to any customer (partner stock)")
+d2.metric("ONT w/ Active Customer", ont_with_active, help="Devices linked to a customer who has not churned")
+d3.metric("ONT w/ Churned Customer", ont_with_churned, help="Devices linked to a customer who has churned")
 
 if _sla_stale:
     st.warning(f"⚠️ Showing **{m2_label}** SLA (most recent available) — {m1_label} & {m0_label} data not yet loaded in the pipeline.", icon=None)
@@ -635,7 +701,7 @@ c1, c2 = st.columns(2)
 with c1:
     fig_inst = go.Figure()
     fig_inst.add_trace(go.Bar(name='Installs', x=month_3, y=installs,
-                                marker_color='#00CC96', text=installs, textposition='outside'))
+                              marker_color='#00CC96', text=installs, textposition='outside'))
     fig_inst.update_layout(title="Monthly Installs", plot_bgcolor='rgba(0,0,0,0)',
                            height=280, margin=dict(t=40, b=20))
     st.plotly_chart(fig_inst, use_container_width=True)
@@ -752,7 +818,7 @@ if pgc is not None:
     svc_tickets = [safe_int(pgc.get(f'service_ticket_m{i}')) for i in [2, 1, 0]]
     svc_sla_cnt = [safe_int(pgc.get(f'service_ticket_sla_m{i}')) for i in [2, 1, 0]]
     dev_tickets = [safe_int(pgc.get(f'device_ticket_m{i}')) for i in [2, 1, 0]]
-    dev_sla_cnt = [safe_int(pgc.get(f'device_ticket_sla_{i}')) for i in [2, 1, 0]]
+    dev_sla_cnt = [safe_int(pgc.get(f'device_ticket_sla_m{i}')) for i in [2, 1, 0]]
 
     ticket_notes = []
 
@@ -798,7 +864,7 @@ else:
 
 st.divider()
 
-# ── Rohit Earnings ────────────────────────────────────────────────────────
+# ── Rohit Earnings ────────────────────────────────────────────────────────────
 st.subheader("🔧 Rohit (Field Technician) Earnings — Month Wise")
 
 with st.spinner("Loading Rohit earnings..."):
@@ -908,7 +974,7 @@ def fetch_customer_data(pid):
     )
     SELECT
         pm.MOBILE,
-        COALESCE(cx.CUSTOMER_NAME, pm.MOBILE)                                             AS NAME,
+        COALESCE(cx.CUSTOMER_NAME, pm.MOBILE)                                           AS NAME,
         ai.ADDRESS,
         id.INSTALL_DATE                                                                  AS INSTALL_DATE,
         lp.LAST_PING_DATE                                                                AS LAST_PING,
@@ -1079,7 +1145,7 @@ elif wallet_err:
 else:
     st.info("No wallet transactions found for this partner.")
 
-# ── Raw Data ────────────────────────────────────────────────────────────────
+# ── Raw Data ──────────────────────────────────────────────────────────────────
 with st.expander("📋 View All Partner Fields"):
     raw = pd.DataFrame([dict(row)]).T.rename(columns={0: 'Value'})
     st.dataframe(raw, use_container_width=True)
