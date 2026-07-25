@@ -355,22 +355,30 @@ def fetch_fixed_payout_monthly_bulk(partner_ids):
 @st.cache_data(ttl=86400)
 def fetch_device_counts_bulk():
     """
-    ONT (device) count per partner, split by where the device currently sits.
+    ONT (device) count per partner, split by where the device CURRENTLY sits.
     Uses the SAME source table as the Metabase question 'Device Details End To End -
     Execution' (card 9457): PROD_DB.PUBLIC.WIOM_DEVICE_DATA, keyed by PARTNER_ID.
-      - WITH_PARTNER          = device not yet linked to any customer (partner stock)
-      - WITH_ACTIVE_CUSTOMER  = linked to a customer who has not churned
-      - WITH_CHURNED_CUSTOMER = linked to a customer who has churned (USER_CHURN_DATE set)
+
+    Uses the LOCATION column (verified via direct query: for rows with a PARTNER_ID,
+    LOCATION only takes values 'partner' or 'customer') as the source of truth for
+    where the device physically is right now — NOT CUSTOMER_ID/USER_CHURN_DATE alone,
+    because a device recovered from a churned customer keeps its historical
+    CUSTOMER_ID and USER_CHURN_DATE but LOCATION flips back to 'partner'. Confirmed
+    ~1,264 such recovered devices would have been mis-bucketed as "with customer" if
+    keyed off CUSTOMER_ID instead of LOCATION.
+      - WITH_PARTNER          = LOCATION = 'partner' (fresh stock + recovered devices)
+      - WITH_ACTIVE_CUSTOMER  = LOCATION = 'customer' and not churned
+      - WITH_CHURNED_CUSTOMER = LOCATION = 'customer' and churned (not yet recovered)
     Returns dict: {partner_id: {'WITH_PARTNER': n, 'WITH_ACTIVE_CUSTOMER': n, 'WITH_CHURNED_CUSTOMER': n}}
     """
     sql = """
     SELECT
         PARTNER_ID,
-        SUM(CASE WHEN CUSTOMER_ID IS NULL THEN 1 ELSE 0 END)
+        SUM(CASE WHEN LOCATION = 'partner' THEN 1 ELSE 0 END)
             AS WITH_PARTNER,
-        SUM(CASE WHEN CUSTOMER_ID IS NOT NULL AND USER_CHURN_DATE IS NULL THEN 1 ELSE 0 END)
+        SUM(CASE WHEN LOCATION = 'customer' AND USER_CHURN_DATE IS NULL THEN 1 ELSE 0 END)
             AS WITH_ACTIVE_CUSTOMER,
-        SUM(CASE WHEN CUSTOMER_ID IS NOT NULL AND USER_CHURN_DATE IS NOT NULL THEN 1 ELSE 0 END)
+        SUM(CASE WHEN LOCATION = 'customer' AND USER_CHURN_DATE IS NOT NULL THEN 1 ELSE 0 END)
             AS WITH_CHURNED_CUSTOMER
     FROM PROD_DB.PUBLIC.WIOM_DEVICE_DATA
     WHERE PARTNER_ID IS NOT NULL
