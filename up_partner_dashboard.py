@@ -1,6 +1,16 @@
 """
 UP Partner Dashboard — powered by Metabase card 7876 (Partner wise earnings view)
 Run with: streamlit run up_partner_dashboard.py --server.port 8502
+
+FIX (2026-07-26, Anurag): The "Quick Overview" table (all-partner list) showed
+raw TOTAL_M0_PAYOUT / TOTAL_M1_PAYOUT computed straight from PARTNER_GROWTH_CARD_RAW's
+FIXED_BONUS_M0/M1 columns. When that column is 0 for a given month (common — the growth
+card pipeline lags), the real fixed payout lives in PARTNER_BONUS_DISBURSEMENT instead.
+The per-partner detail view already corrected for this (see fetch_fixed_payout_monthly),
+but the Quick Overview table did not, so June/July totals shown there were understated
+for any partner whose FIXED_BONUS_M0/M1 was 0 in the raw table.
+This version applies the same correction to ALL partners in the Quick Overview table,
+via one bulk query instead of one query per partner.
 """
 
 import os
@@ -37,6 +47,11 @@ m3_label = (today.replace(day=1) - relativedelta(months=3)).strftime('%b %Y')
 m2_label = (today.replace(day=1) - relativedelta(months=2)).strftime('%b %Y')
 m1_label = (today.replace(day=1) - relativedelta(months=1)).strftime('%b %Y')
 m0_label =  today.replace(day=1).strftime('%b %Y')
+
+# Month keys for lookups (used by both detail view and quick overview)
+m0_key = today.replace(day=1).strftime('%Y-%m')
+m1_key = (today.replace(day=1) - relativedelta(months=1)).strftime('%Y-%m')
+m2_key = (today.replace(day=1) - relativedelta(months=2)).strftime('%Y-%m')
 
 UP_ZONES = {'Agra','Agra++','Meerut','Meerut++','Bareilly','Bareilly++',
             'Gorakhpur','Prayagraj','Lucknow','Meerut City'}
@@ -301,6 +316,43 @@ def fetch_fixed_payout_monthly(partner_id):
 
 
 @st.cache_data(ttl=86400)
+def fetch_fixed_payout_monthly_bulk(partner_ids):
+    """
+    Bulk version of fetch_fixed_payout_monthly — one query for ALL partners
+    instead of one query per partner. Used to correct the Quick Overview table.
+    Same paid/accrued logic as the per-partner version.
+    Returns dict: {(partner_id, 'YYYY-MM'): fixed_paid}
+    """
+    ids = sorted(set(int(p) for p in partner_ids if p is not None))
+    if not ids:
+        return {}
+    dec_start = (today.replace(day=1) - relativedelta(months=3)).strftime('%Y-%m-01')
+    ids_csv = ",".join(str(i) for i in ids)
+    sql = f"""
+    SELECT
+        ACCOUNT_ID,
+        DATE_TRUNC('month', ADDED_TIME)::DATE AS month,
+        SUM(AMOUNT) AS fixed_paid
+    FROM DYNAMODB.PARTNER_BONUS_DISBURSEMENT
+    WHERE ACCOUNT_ID IN ({ids_csv})
+      AND _FIVETRAN_DELETED = FALSE
+      AND ADDED_TIME >= '{dec_start}'
+      AND (BONUS_STATUS = 5 OR DATE_TRUNC('month', ADDED_TIME::DATE) = DATE_TRUNC('month', CURRENT_DATE))
+    GROUP BY 1, 2
+    """
+    try:
+        df = run_sql(sql)
+    except Exception:
+        return {}
+    lookup = {}
+    for _, r in df.iterrows():
+        pid = safe_int(r['ACCOUNT_ID'])
+        month_key = pd.to_datetime(r['MONTH']).strftime('%Y-%m')
+        lookup[(pid, month_key)] = safe_float(r['FIXED_PAID'])
+    return lookup
+
+
+@st.cache_data(ttl=86400)
 def fetch_rohit_earnings(partner_id):
     dec_start = (today.replace(day=1) - relativedelta(months=3)).strftime('%Y-%m-01')
     sql = f"""
@@ -357,15 +409,38 @@ selected_name = st.selectbox(
 if not selected_name:
     st.info("👆 Select a partner above to view their performance data.")
     st.subheader(f"All UP Partners — Quick Overview ({len(all_df)} partners)")
+
+    # ---- FIX: correct M0/M1 payout totals for every partner the same way ----
+    # the per-partner detail view does — pull the real fixed payout from
+    # PARTNER_BONUS_DISBURSEMENT whenever FIXED_BONUS_M0/M1 was 0 in the raw
+    # growth-card table (one bulk query for all partners, not per-partner).
+    all_ids = all_df['PARTNER_ACCOUNT_ID'].dropna().apply(safe_int).tolist()
+    with st.spinner("Correcting payout totals (fixed-payout fallback)..."):
+        fixed_bulk = fetch_fixed_payout_monthly_bulk(all_ids)
+
+    def _corrected_totals(r):
+        pid = safe_int(r.get('PARTNER_ACCOUNT_ID'))
+        out = {}
+        for i, key in enumerate([m2_key, m1_key, m0_key]):
+            card_fixed_v = safe_float(r.get(f'M{2 - i}_FIXED_PAYOUT'))
+            total_v = safe_float(r.get(f'TOTAL_M{2 - i}_PAYOUT'))
+            if card_fixed_v == 0:
+                total_v += fixed_bulk.get((pid, key), 0)
+            out[f'CORR_M{2 - i}_PAYOUT'] = total_v
+        return pd.Series(out)
+
+    corrections = all_df.apply(_corrected_totals, axis=1)
+    all_df = pd.concat([all_df, corrections], axis=1)
+
     disp = all_df[['PARTNER_NAME', 'ZONE', 'ACTIVE_BASE', 'PARTNER_STATUS',
-                    'LIFETIME_EARNING', 'TOTAL_M0_PAYOUT', 'TOTAL_M1_PAYOUT']].copy()
+                    'LIFETIME_EARNING', 'CORR_M0_PAYOUT', 'CORR_M1_PAYOUT']].copy()
     disp['LIFETIME_EARNING'] = disp['LIFETIME_EARNING'].apply(lambda x: f"₹{safe_float(x):,.0f}")
-    disp['TOTAL_M0_PAYOUT']  = disp['TOTAL_M0_PAYOUT'].apply(lambda x: f"₹{safe_float(x):,.0f}")
-    disp['TOTAL_M1_PAYOUT']  = disp['TOTAL_M1_PAYOUT'].apply(lambda x: f"₹{safe_float(x):,.0f}")
+    disp['CORR_M0_PAYOUT']   = disp['CORR_M0_PAYOUT'].apply(lambda x: f"₹{safe_float(x):,.0f}")
+    disp['CORR_M1_PAYOUT']   = disp['CORR_M1_PAYOUT'].apply(lambda x: f"₹{safe_float(x):,.0f}")
     disp = disp.sort_values('ACTIVE_BASE', ascending=False).rename(columns={
         'PARTNER_NAME': 'Partner', 'ZONE': 'Zone', 'ACTIVE_BASE': 'Active Base',
         'PARTNER_STATUS': 'Status', 'LIFETIME_EARNING': 'Lifetime Earning',
-        'TOTAL_M0_PAYOUT': f'{m0_label} Payout', 'TOTAL_M1_PAYOUT': f'{m1_label} Payout'
+        'CORR_M0_PAYOUT': f'{m0_label} Payout', 'CORR_M1_PAYOUT': f'{m1_label} Payout'
     })
     st.dataframe(disp, use_container_width=True, height=500, hide_index=True)
     st.stop()
@@ -560,7 +635,7 @@ c1, c2 = st.columns(2)
 with c1:
     fig_inst = go.Figure()
     fig_inst.add_trace(go.Bar(name='Installs', x=month_3, y=installs,
-                              marker_color='#00CC96', text=installs, textposition='outside'))
+                                marker_color='#00CC96', text=installs, textposition='outside'))
     fig_inst.update_layout(title="Monthly Installs", plot_bgcolor='rgba(0,0,0,0)',
                            height=280, margin=dict(t=40, b=20))
     st.plotly_chart(fig_inst, use_container_width=True)
@@ -585,11 +660,6 @@ st.subheader("💰 Earnings")
 lifetime = safe_float(row.get('LIFETIME_EARNING'))
 partner_lottery = safe_float(row.get('PARTNER_LOTTERY_EARNING'))
 rohit_lottery   = safe_float(row.get('ROHIT_LOTTERY_EARNING'))
-
-# Month keys for lookup
-m0_key = today.replace(day=1).strftime('%Y-%m')
-m1_key = (today.replace(day=1) - relativedelta(months=1)).strftime('%Y-%m')
-m2_key = (today.replace(day=1) - relativedelta(months=2)).strftime('%Y-%m')
 
 # Fetch actual fixed payouts from PARTNER_BONUS_DISBURSEMENT
 with st.spinner("Loading fixed payout data..."):
@@ -682,7 +752,7 @@ if pgc is not None:
     svc_tickets = [safe_int(pgc.get(f'service_ticket_m{i}')) for i in [2, 1, 0]]
     svc_sla_cnt = [safe_int(pgc.get(f'service_ticket_sla_m{i}')) for i in [2, 1, 0]]
     dev_tickets = [safe_int(pgc.get(f'device_ticket_m{i}')) for i in [2, 1, 0]]
-    dev_sla_cnt = [safe_int(pgc.get(f'device_ticket_sla_m{i}')) for i in [2, 1, 0]]
+    dev_sla_cnt = [safe_int(pgc.get(f'device_ticket_sla_{i}')) for i in [2, 1, 0]]
 
     ticket_notes = []
 
@@ -728,7 +798,7 @@ else:
 
 st.divider()
 
-# ── Rohit Earnings ────────────────────────────────────────────────────────────
+# ── Rohit Earnings ────────────────────────────────────────────────────────
 st.subheader("🔧 Rohit (Field Technician) Earnings — Month Wise")
 
 with st.spinner("Loading Rohit earnings..."):
@@ -838,7 +908,7 @@ def fetch_customer_data(pid):
     )
     SELECT
         pm.MOBILE,
-        COALESCE(cx.CUSTOMER_NAME, pm.MOBILE)                                           AS NAME,
+        COALESCE(cx.CUSTOMER_NAME, pm.MOBILE)                                             AS NAME,
         ai.ADDRESS,
         id.INSTALL_DATE                                                                  AS INSTALL_DATE,
         lp.LAST_PING_DATE                                                                AS LAST_PING,
@@ -1009,7 +1079,7 @@ elif wallet_err:
 else:
     st.info("No wallet transactions found for this partner.")
 
-# ── Raw Data ──────────────────────────────────────────────────────────────────
+# ── Raw Data ────────────────────────────────────────────────────────────────
 with st.expander("📋 View All Partner Fields"):
     raw = pd.DataFrame([dict(row)]).T.rename(columns={0: 'Value'})
     st.dataframe(raw, use_container_width=True)
