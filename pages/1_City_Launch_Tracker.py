@@ -33,11 +33,20 @@ Sources:
 Definitions confirmed with Anurag:
   - Active   = plan currently running, OR within the 15-day grace window after expiry.
   - Live     = plan currently running (strictly not expired, not in grace).
-  - R30+     = still Live, and it's been 30+ days since their last recharge (i.e. on a
-               plan longer than ~30 days that's still running).
+  - R30+     = out of everyone ever installed for this partner, how many have NOT
+               recharged in the last 30 days (i.e. it's been 30+ days since their most
+               recent recharge, whether or not that plan is still technically running).
+               Example: 100 customers installed to date, 70 haven't recharged in the
+               last 30 days -> R30+ = 70.
   - M1 Expired = installed 30+ days ago and has NEVER recharged again since the first plan.
   - M1 Renewed = installed 30+ days ago and HAS recharged again at least once since.
   - Tickets / Resolved = last 30 days only.
+
+Fixed 2026-07-26 (Anurag): R30+ previously required BOTH "still Live" AND "30+ days
+since last recharge started" — with plans mostly 28-30 days long, that combination is
+almost always false, so R30+ was stuck at 0. Removed the Live requirement per Anurag's
+clarification: R30+ is simply "haven't recharged in the last 30 days," regardless of
+whether their last plan has technically expired yet.
 """
 
 import os
@@ -229,8 +238,7 @@ def fetch_partner_table(funnel_city):
                             THEN ms.MOBILE END) AS ACTIVE,
             COUNT(DISTINCT CASE WHEN ms.LAST_EXPIRY >= CURRENT_TIMESTAMP
                             THEN ms.MOBILE END) AS LIVE,
-            COUNT(DISTINCT CASE WHEN ms.LAST_EXPIRY >= CURRENT_TIMESTAMP
-                                 AND DATEDIFF('day', ms.LAST_START, CURRENT_TIMESTAMP) >= 30
+            COUNT(DISTINCT CASE WHEN DATEDIFF('day', ms.LAST_START, CURRENT_TIMESTAMP) >= 30
                             THEN ms.MOBILE END) AS R30_PLUS,
             COUNT(DISTINCT CASE WHEN DATEDIFF('day', ms.FIRST_START, CURRENT_TIMESTAMP) >= 30
                                  AND ms.RECHARGE_COUNT = 1
