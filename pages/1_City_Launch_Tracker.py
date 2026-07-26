@@ -10,11 +10,25 @@ Bareilly, Meerut City, Agra); every number shown is queried fresh.
 
 Sources:
   - DBT.AGG_PARTNER_FUNNEL (PARTNER_CITY) — today's roster of partners in each city.
-  - PROD_DB.PUBLIC.WIOM_DEVICE_DATA (C_CITY) — city-wide Active Base.
-  - PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO — per-customer recharge history, used
-    to compute each partner's Total Gross / Active / Live / R30+ / M1 Expired / M1 Renewed.
-  - PROD_DB.PUBLIC.TASK_LOGS + PROD_DB.DYNAMODB_READ.BOOKING — day-by-day installs & leads.
+  - PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO — per-customer recharge history, used to
+    compute Active Base, day-by-day Installs, and each partner's Total Gross / Active /
+    Live / R30+ / M1 Expired / M1 Renewed.
+  - PROD_DB.DYNAMODB_READ.BOOKING — day-by-day Leads (by partner LCO_ACCOUNT_ID).
   - DBT.FCT_CX_SERVICE_TICKETS_BY_PARTNER_DAILY — tickets in the last 30 days.
+
+  Fixed 2026-07-26 (Anurag reported: dropdown not switching city, Active Base wrong,
+  installs stuck at 0, R30+ never updating):
+  - Active Base was reading PROD_DB.PUBLIC.WIOM_DEVICE_DATA, which turned out to be a
+    stale/frozen snapshot (no install activity recorded past Jan 2026). Switched to the
+    same live HOME_ROUTER_PLAN_INFO-based Active/Live logic used for the partner table.
+  - Installs was reading TASK_LOGS for an 'OTP_VERIFIED' event that doesn't exist in that
+    table (it's a ticketing log, not an onboarding log) — installs were always 0. Switched
+    to each customer's first-ever plan start date in HOME_ROUTER_PLAN_INFO.
+  - Leads was filtered to mobiles that already had a plan record, which excludes most real
+    leads (people who haven't installed yet). Switched to filtering BOOKING directly by the
+    partner's LCO_ACCOUNT_ID.
+  - The city dropdown didn't have a stable widget key, which could let Streamlit reuse a
+    stale render — added an explicit key so the label and the data always match.
 
 Definitions confirmed with Anurag:
   - Active   = plan currently running, OR within the 15-day grace window after expiry.
@@ -82,28 +96,41 @@ def safe_float(val):
         return 0.0
 
 
-# City name as it appears in each live Snowflake source
+# City name as it appears in DBT.AGG_PARTNER_FUNNEL.PARTNER_CITY
 CITY_SQL_NAMES = {
-    "Saharanpur": {"funnel": "Saharanpur", "device": "Saharanpur"},
-    "Bijnor": {"funnel": "Bijnor", "device": "Bijnor"},
-    "Muzaffarnagar": {"funnel": "Muzaffarnagar", "device": "Muzaffarnagar"},
-    "Hapur": {"funnel": "Hapur", "device": "Hapur"},
-    "Aligarh": {"funnel": "Aligarh", "device": "Aligarh"},
-    "Mathura": {"funnel": "Mathura", "device": "Mathura"},
-    "Firozabad": {"funnel": "Firozabad", "device": "Firozabad"},
-    "Moradabad": {"funnel": "Moradabad", "device": "Moradabad"},
-    "Bareilly": {"funnel": "Bareilly", "device": "Bareilly"},
-    "Meerut City": {"funnel": "Meerut_City", "device": "Meerut"},
-    "Agra": {"funnel": "Agra", "device": "Agra"},
+    "Saharanpur": {"funnel": "Saharanpur"},
+    "Bijnor": {"funnel": "Bijnor"},
+    "Muzaffarnagar": {"funnel": "Muzaffarnagar"},
+    "Hapur": {"funnel": "Hapur"},
+    "Aligarh": {"funnel": "Aligarh"},
+    "Mathura": {"funnel": "Mathura"},
+    "Firozabad": {"funnel": "Firozabad"},
+    "Moradabad": {"funnel": "Moradabad"},
+    "Bareilly": {"funnel": "Bareilly"},
+    "Meerut City": {"funnel": "Meerut_City"},
+    "Agra": {"funnel": "Agra"},
 }
 
 
 @st.cache_data(ttl=3600)
-def fetch_active_base(device_city):
+def fetch_active_base(funnel_city):
     sql = f"""
-    SELECT COUNT(DISTINCT CASE WHEN CUSTOMER_STATUS = 'Active_Customer' THEN CUSTOMER_ID END) AS ACTIVE_BASE
-    FROM PROD_DB.PUBLIC.WIOM_DEVICE_DATA
-    WHERE TRIM(C_CITY) = '{device_city}'
+    WITH partner_list AS (
+        SELECT DISTINCT PARTNER_ID FROM DBT.AGG_PARTNER_FUNNEL WHERE TRIM(PARTNER_CITY) = '{funnel_city}'
+    ),
+    plans AS (
+        SELECT MOBILE, DATEADD('second', TIME_PLAN, PLAN_START_TIME) AS PLAN_EXPIRY
+        FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
+        WHERE LCO_ACCOUNT_ID IN (SELECT PARTNER_ID FROM partner_list)
+    ),
+    last_plan AS (
+        SELECT MOBILE, PLAN_EXPIRY AS LAST_EXPIRY
+        FROM plans QUALIFY ROW_NUMBER() OVER (PARTITION BY MOBILE ORDER BY PLAN_EXPIRY DESC) = 1
+    )
+    SELECT COUNT(DISTINCT CASE WHEN LAST_EXPIRY >= CURRENT_TIMESTAMP
+                                 OR DATEDIFF('day', LAST_EXPIRY, CURRENT_TIMESTAMP) <= 15
+                            THEN MOBILE END) AS ACTIVE_BASE
+    FROM last_plan
     """
     try:
         df = run_sql(sql)
@@ -119,22 +146,25 @@ def fetch_daily_leads_installs(funnel_city):
     WITH partner_list AS (
         SELECT DISTINCT PARTNER_ID FROM DBT.AGG_PARTNER_FUNNEL WHERE TRIM(PARTNER_CITY) = '{funnel_city}'
     ),
-    city_mobiles AS (
-        SELECT DISTINCT MOBILE FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
+    plans AS (
+        SELECT MOBILE, PLAN_START_TIME
+        FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
         WHERE LCO_ACCOUNT_ID IN (SELECT PARTNER_ID FROM partner_list)
     ),
+    first_plan AS (
+        SELECT MOBILE, MIN(PLAN_START_TIME) AS FIRST_START
+        FROM plans GROUP BY 1
+    ),
     installs AS (
-        SELECT TO_DATE(DATEADD('minute', 330, ADDED_TIME)) AS DAY, COUNT(DISTINCT MOBILE) AS INSTALLS
-        FROM PROD_DB.PUBLIC.TASK_LOGS
-        WHERE EVENT_NAME = 'OTP_VERIFIED'
-          AND MOBILE IN (SELECT MOBILE FROM city_mobiles)
-          AND ADDED_TIME >= DATEADD('day', -30, CURRENT_DATE)
+        SELECT TO_DATE(FIRST_START) AS DAY, COUNT(DISTINCT MOBILE) AS INSTALLS
+        FROM first_plan
+        WHERE FIRST_START >= DATEADD('day', -30, CURRENT_DATE)
         GROUP BY 1
     ),
     leads AS (
         SELECT TO_DATE(DATEADD('minute', 330, ADDED_TIME)) AS DAY, COUNT(DISTINCT MOBILE) AS LEADS
         FROM PROD_DB.DYNAMODB_READ.BOOKING
-        WHERE MOBILE IN (SELECT MOBILE FROM city_mobiles)
+        WHERE LCO_ACCOUNT_ID IN (SELECT PARTNER_ID FROM partner_list)
           AND ADDED_TIME >= DATEADD('day', -30, CURRENT_DATE)
         GROUP BY 1
     )
@@ -242,11 +272,11 @@ def fetch_partner_table(funnel_city):
 st.title("🏙️ City Launch Tracker")
 st.caption("Everything on this page is live from Snowflake, refreshed hourly. Nothing is pulled from the launch-tracker Google Sheet.")
 
-city = st.selectbox("Select City", sorted(CITY_SQL_NAMES.keys()))
+city = st.selectbox("Select City", sorted(CITY_SQL_NAMES.keys()), key="city_select")
 sql_names = CITY_SQL_NAMES[city]
 
-with st.spinner("Loading Active Base..."):
-    active_base = fetch_active_base(sql_names["device"])
+with st.spinner(f"Loading Active Base for {city}..."):
+    active_base = fetch_active_base(sql_names["funnel"])
 
 st.metric("Active Base (city-wide)", f"{active_base:,}")
 
@@ -296,4 +326,4 @@ if not partner_df.empty:
 else:
     st.info(f"No partners found for {city}.")
 
-st.caption(f"Source: DBT.AGG_PARTNER_FUNNEL + WIOM_DEVICE_DATA + HOME_ROUTER_PLAN_INFO + FCT_CX_SERVICE_TICKETS_BY_PARTNER_DAILY (Snowflake) · Last refreshed: {datetime.now().strftime('%d %b %Y, %I:%M %p')}")
+st.caption(f"Source: DBT.AGG_PARTNER_FUNNEL + HOME_ROUTER_PLAN_INFO + BOOKING + FCT_CX_SERVICE_TICKETS_BY_PARTNER_DAILY (Snowflake) · Last refreshed: {datetime.now().strftime('%d %b %Y, %I:%M %p')}")
