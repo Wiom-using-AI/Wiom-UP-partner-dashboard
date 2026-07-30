@@ -141,8 +141,7 @@ SELECT
     CASE WHEN COALESCE(SERVICE_TICKET_M0,0)>0 THEN COALESCE(SERVICE_TICKET_SLA_M0,0)::FLOAT/SERVICE_TICKET_M0 ELSE 0 END AS CURRENT_SERVICE_SLA,
     CASE WHEN COALESCE(DEVICE_TICKET_M0,0)>0 THEN COALESCE(DEVICE_TICKET_SLA_M0,0)::FLOAT/DEVICE_TICKET_M0 ELSE 0 END AS CURRENT_DEVICE_SLA,
     0 AS CURRENT_RATING,
-    0 AS PARTNER_LOTTERY_EARNING,
-    0 AS ROHIT_LOTTERY_EARNING
+    0 AS PARTNER_LOTTERY_EARNING
 FROM PUBLIC.PARTNER_GROWTH_CARD_RAW
 WHERE ZONE IN ('{zones_sql}')
 """
@@ -399,28 +398,6 @@ def fetch_device_counts_bulk():
     return out
 
 
-@st.cache_data(ttl=86400)
-def fetch_rohit_earnings(partner_id):
-    dec_start = (today.replace(day=1) - relativedelta(months=3)).strftime('%Y-%m-01')
-    sql = f"""
-    SELECT
-        DATE_TRUNC('month', CREATED_AT)::DATE AS month,
-        SUM(CASE WHEN STATUS = 'CLAIMED'   THEN DISBURSEMENT_AMOUNT ELSE 0 END) AS claimed,
-        SUM(CASE WHEN STATUS = 'UNCLAIMED' THEN DISBURSEMENT_AMOUNT ELSE 0 END) AS unclaimed,
-        SUM(CASE WHEN STATUS = 'PROMISED'  THEN DISBURSEMENT_AMOUNT ELSE 0 END) AS promised,
-        SUM(CASE WHEN STATUS = 'MISSED'    THEN DISBURSEMENT_AMOUNT ELSE 0 END) AS missed,
-        SUM(CASE WHEN STATUS = 'EXPIRED'   THEN DISBURSEMENT_AMOUNT ELSE 0 END) AS expired,
-        SUM(DISBURSEMENT_AMOUNT) AS total_earned,
-        COUNT(DISTINCT PARTNER_ID) AS rohit_count
-    FROM PARTNER_INCENTIVE_SERVICE_PUBLIC.PARTNER_INCENTIVES
-    WHERE LCO_ACCOUNT_ID = {partner_id}
-      AND USER_TYPE = 'ROHIT'
-      AND _FIVETRAN_DELETED = FALSE
-      AND CREATED_AT >= '{dec_start}'
-    GROUP BY 1
-    ORDER BY 1 DESC
-    """
-    return run_sql(sql)
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -733,7 +710,6 @@ st.subheader("💰 Earnings")
 
 lifetime = safe_float(row.get('LIFETIME_EARNING'))
 partner_lottery = safe_float(row.get('PARTNER_LOTTERY_EARNING'))
-rohit_lottery   = safe_float(row.get('ROHIT_LOTTERY_EARNING'))
 
 # Fetch actual fixed payouts from PARTNER_BONUS_DISBURSEMENT
 with st.spinner("Loading fixed payout data..."):
@@ -769,7 +745,7 @@ c2.metric("Avg Monthly Earning (3M)", f"₹{avg_3m:,.0f}")
 c3.metric(f"{m0_label} Payout (MTD)", f"₹{total_payouts[2]:,.0f}",
           help="Fixed payout = all accrued renewals this month (including unpaid). Rating & SLA bonuses are calculated at month-end.")
 c4.metric("Partner Lottery (Lifetime)", f"₹{partner_lottery:,.0f}",
-          help=f"Rohit Lottery: ₹{rohit_lottery:,.0f} · Both are lifetime totals from earnings view")
+          help="Lifetime total from earnings view")
 
 fig_earn = go.Figure()
 fig_earn.add_trace(go.Bar(name='Fixed Payout (per renewal)', x=month_3, y=fixed_payouts,   marker_color='#FFA15A'))
@@ -814,8 +790,8 @@ with st.expander("📋 Detailed Earnings Breakdown"):
     })
     st.dataframe(earn_detail, use_container_width=True, hide_index=True)
 
-    if partner_lottery > 0 or rohit_lottery > 0:
-        st.markdown(f"**Lottery Earnings (Lifetime):** Partner ₹{partner_lottery:,.0f} &nbsp;|&nbsp; Rohit ₹{rohit_lottery:,.0f}")
+    if partner_lottery > 0:
+        st.markdown(f"**Lottery Earnings (Lifetime):** Partner ₹{partner_lottery:,.0f}")
 
 st.divider()
 
@@ -869,51 +845,6 @@ if pgc is not None:
         st.plotly_chart(fig_dev, use_container_width=True)
 else:
     st.info("Ticket data not available for this partner.")
-
-st.divider()
-
-# ── Rohit Earnings ────────────────────────────────────────────────────────────
-st.subheader("🔧 Rohit (Field Technician) Earnings — Month Wise")
-
-with st.spinner("Loading Rohit earnings..."):
-    try:
-        rohit_df = fetch_rohit_earnings(partner_id)
-    except Exception as e:
-        rohit_df = None
-        st.error(f"Could not load Rohit earnings: {e}")
-
-if rohit_df is not None and len(rohit_df) > 0:
-    rohit_df = rohit_df.copy()
-    rohit_df['month_label'] = pd.to_datetime(rohit_df['MONTH']).dt.strftime('%b %Y')
-    rohit_df = rohit_df.sort_values('MONTH')
-
-    latest = rohit_df.iloc[-1]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Active Rohits (latest month)", safe_int(latest.get('ROHIT_COUNT')))
-    c2.metric("Claimed (latest month)", f"₹{safe_float(latest.get('CLAIMED')):,.0f}")
-    c3.metric("Missed (latest month)",  f"₹{safe_float(latest.get('MISSED')):,.0f}")
-    c4.metric("Total (latest month)",   f"₹{safe_float(latest.get('TOTAL_EARNED')):,.0f}")
-
-    fig_rohit = go.Figure()
-    fig_rohit.add_trace(go.Bar(name='Claimed',   x=rohit_df['month_label'], y=rohit_df['CLAIMED'].astype(float),   marker_color='#00CC96'))
-    fig_rohit.add_trace(go.Bar(name='Unclaimed', x=rohit_df['month_label'], y=rohit_df['UNCLAIMED'].astype(float), marker_color='#636EFA'))
-    fig_rohit.add_trace(go.Bar(name='Promised',  x=rohit_df['month_label'], y=rohit_df['PROMISED'].astype(float),  marker_color='#FFA15A'))
-    fig_rohit.add_trace(go.Bar(name='Missed',    x=rohit_df['month_label'], y=rohit_df['MISSED'].astype(float),    marker_color='#EF553B'))
-    fig_rohit.add_trace(go.Bar(name='Expired',   x=rohit_df['month_label'], y=rohit_df['EXPIRED'].astype(float),   marker_color='#BEBEBE'))
-    fig_rohit.update_layout(
-        barmode='stack', title="Rohit Incentives by Month (₹)",
-        yaxis_title="₹", plot_bgcolor='rgba(0,0,0,0)',
-        height=320, margin=dict(t=40, b=20)
-    )
-    st.plotly_chart(fig_rohit, use_container_width=True)
-
-    disp_rohit = rohit_df[['month_label', 'ROHIT_COUNT', 'CLAIMED', 'UNCLAIMED', 'PROMISED', 'MISSED', 'EXPIRED', 'TOTAL_EARNED']].copy()
-    for col in ['CLAIMED', 'UNCLAIMED', 'PROMISED', 'MISSED', 'EXPIRED', 'TOTAL_EARNED']:
-        disp_rohit[col] = disp_rohit[col].apply(lambda x: f"₹{safe_float(x):,.0f}")
-    disp_rohit.columns = ['Month', 'Rohits', 'Claimed', 'Unclaimed', 'Promised', 'Missed', 'Expired', 'Total Earned']
-    st.dataframe(disp_rohit, use_container_width=True, hide_index=True)
-else:
-    st.info("No Rohit earning data found for this partner in the selected period.")
 
 st.divider()
 
