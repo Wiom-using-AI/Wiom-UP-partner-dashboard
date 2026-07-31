@@ -258,6 +258,125 @@ def fetch_live_sla_range(partner_id, start_date, end_date=None):
 
 
 @st.cache_data(ttl=3600)
+def fetch_customer_data(pid):
+    sql = f"""
+    WITH partner_mobiles AS (
+        SELECT DISTINCT MOBILE, MAX(NAS_ID) AS NAS_ID, MAX(DEVICE_ID) AS DEVICE_ID
+        FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
+        WHERE LCO_ACCOUNT_ID = {pid}
+        GROUP BY MOBILE
+    ),
+    current_plan AS (
+        SELECT MOBILE,
+               DATEADD('minute', 330, PLAN_START_TIME)                                              AS LAST_RECHARGE_IST,
+               DATEADD('minute', 330, DATEADD('second', TIME_PLAN, PLAN_START_TIME))               AS PLAN_EXPIRY_IST,
+               CHARGES,
+               ROUND(TIME_PLAN / 86400.0, 0)                                                       AS PLAN_DAYS,
+               SPEED_MBPS
+        FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
+        WHERE LCO_ACCOUNT_ID = {pid}
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY MOBILE ORDER BY PLAN_START_TIME DESC) = 1
+    ),
+    cx_info AS (
+        SELECT b.MOBILE, b.NAME AS CUSTOMER_NAME
+        FROM PROD_DB.DYNAMODB_READ.BOOKING b
+        WHERE b.MOBILE IN (SELECT MOBILE FROM partner_mobiles)
+          AND b._FIVETRAN_DELETED = FALSE
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY b.MOBILE ORDER BY b.MOBILE) = 1
+    ),
+    addr_info AS (
+        SELECT bl.MOBILE,
+               CONCAT_WS(', ',
+                   NULLIF(TRY_PARSE_JSON(TRY_PARSE_JSON(bl.DATA):address::STRING):home::STRING, ''),
+                   NULLIF(TRY_PARSE_JSON(TRY_PARSE_JSON(bl.DATA):address::STRING):city::STRING, '')
+               ) AS ADDRESS
+        FROM PROD_DB.PUBLIC.BOOKING_LOGS bl
+        WHERE bl.MOBILE IN (SELECT MOBILE FROM partner_mobiles)
+          AND bl.EVENT_NAME = 'address_updated'
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY bl.MOBILE ORDER BY bl.ADDED_TIME DESC) = 1
+    ),
+    last_ping AS (
+        SELECT pm.MOBILE,
+               MAX(u.ADDED_DATE) AS LAST_PING_DATE
+        FROM partner_mobiles pm
+        JOIN PROD_DB.PUBLIC.CUSTOMER_DAILY_DATA_USAGE u ON u.NASID = pm.NAS_ID
+        GROUP BY pm.MOBILE
+    ),
+    install_date AS (
+        SELECT MOBILE,
+               TO_DATE(DATEADD('minute', 330, MIN(ADDED_TIME))) AS INSTALL_DATE
+        FROM PROD_DB.PUBLIC.TASK_LOGS
+        WHERE MOBILE IN (SELECT MOBILE FROM partner_mobiles)
+          AND EVENT_NAME = 'OTP_VERIFIED'
+        GROUP BY MOBILE
+    ),
+    recharge_count AS (
+        SELECT MOBILE, COUNT(*) AS RECHARGE_COUNT
+        FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
+        WHERE LCO_ACCOUNT_ID = {pid}
+          AND CHARGES > 0
+        GROUP BY MOBILE
+    ),
+    latest_optical AS (
+        SELECT NAS_ID, AVG_OPTICAL_DBM, OPTICAL_HEALTH, DATE_IST,
+               ROW_NUMBER() OVER (PARTITION BY NAS_ID ORDER BY DATE_IST DESC) AS rn
+        FROM PROD_DB.DBT.FCT_OPTICAL_SIGNAL
+        WHERE NAS_ID IN (SELECT NAS_ID FROM partner_mobiles WHERE NAS_ID IS NOT NULL)
+    ),
+    latest_speed AS (
+        SELECT DEVICEID, SPEED, LATENCY, JITTER, TESTED_ON,
+               ROW_NUMBER() OVER (PARTITION BY DEVICEID ORDER BY TESTED_ON DESC) AS rn
+        FROM PROD_DB.DBT.DAILY_SPEED_TEST
+        WHERE DEVICEID IN (SELECT DEVICE_ID FROM partner_mobiles WHERE DEVICE_ID IS NOT NULL)
+    )
+    SELECT
+        pm.MOBILE,
+        COALESCE(cx.CUSTOMER_NAME, pm.MOBILE)                                           AS NAME,
+        ai.ADDRESS,
+        id.INSTALL_DATE                                                                  AS INSTALL_DATE,
+        lp.LAST_PING_DATE                                                                AS LAST_PING,
+        cp.LAST_RECHARGE_IST                                                             AS LAST_RECHARGE,
+        COALESCE(rc.RECHARGE_COUNT, 0)                                                   AS RECHARGE_COUNT,
+        cp.PLAN_EXPIRY_IST                                                               AS PLAN_EXPIRY,
+        CONCAT_WS(' | ',
+            NULLIF(cp.SPEED_MBPS::STRING || ' Mbps', ' Mbps'),
+            NULLIF(cp.PLAN_DAYS::INT::STRING || 'd', 'd'),
+            NULLIF('Rs ' || cp.CHARGES::INT::STRING, 'Rs ')
+        )                                                                                AS PLAN_DETAILS,
+        CASE
+            WHEN cp.PLAN_EXPIRY_IST IS NULL THEN NULL
+            WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN NULL
+            ELSE DATEDIFF('day', cp.PLAN_EXPIRY_IST::DATE, CURRENT_DATE)
+        END                                                                              AS DAYS_SINCE_EXPIRY,
+        CASE
+            WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN 'Active'
+            WHEN cp.PLAN_EXPIRY_IST IS NULL THEN 'No Plan'
+            ELSE 'Expired'
+        END                                                                              AS STATUS,
+        opt.AVG_OPTICAL_DBM                                                              AS AVG_OPTICAL_DBM,
+        opt.OPTICAL_HEALTH                                                               AS OPTICAL_HEALTH,
+        opt.DATE_IST                                                                     AS OPTICAL_DATE,
+        spd.SPEED                                                                        AS ACTUAL_SPEED_MBPS,
+        spd.LATENCY                                                                      AS LATENCY,
+        spd.JITTER                                                                       AS JITTER,
+        spd.TESTED_ON                                                                    AS TESTED_ON
+    FROM partner_mobiles pm
+    LEFT JOIN cx_info        cx  ON cx.MOBILE = pm.MOBILE
+    LEFT JOIN addr_info      ai  ON ai.MOBILE = pm.MOBILE
+    LEFT JOIN current_plan   cp  ON cp.MOBILE = pm.MOBILE
+    LEFT JOIN last_ping      lp  ON lp.MOBILE = pm.MOBILE
+    LEFT JOIN install_date   id  ON id.MOBILE = pm.MOBILE
+    LEFT JOIN recharge_count rc  ON rc.MOBILE = pm.MOBILE
+    LEFT JOIN latest_optical opt ON opt.NAS_ID = pm.NAS_ID AND opt.rn = 1
+    LEFT JOIN latest_speed   spd ON spd.DEVICEID = pm.DEVICE_ID AND spd.rn = 1
+    ORDER BY
+        CASE WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN 0 ELSE 1 END,
+        cp.PLAN_EXPIRY_IST DESC NULLS LAST
+    """
+    return run_sql(sql)
+
+
+@st.cache_data(ttl=3600)
 def fetch_active_base_all_months(partner_id):
     """
     Returns (m0, m1, m2, m3) active base from PARTNER_GROWTH_CARD_RAW pre-computed values.
@@ -506,6 +625,32 @@ ont_with_partner = _dc.get('WITH_PARTNER', 0)
 ont_with_active = _dc.get('WITH_ACTIVE_CUSTOMER', 0)
 ont_with_churned = _dc.get('WITH_CHURNED_CUSTOMER', 0)
 
+# Customer-level data (also powers the optical power / speed summary below and the
+# "All Customers" table further down the page)
+with st.spinner("Loading customer data..."):
+    try:
+        cx_df = fetch_customer_data(partner_id)
+        cx_data_err = None
+    except Exception as e:
+        cx_df = None
+        cx_data_err = str(e)
+
+if cx_df is not None and len(cx_df) > 0:
+    _optical_mask = cx_df['AVG_OPTICAL_DBM'].notna()
+    optical_n = int(_optical_mask.sum())
+    avg_optical = cx_df.loc[_optical_mask, 'AVG_OPTICAL_DBM'].apply(safe_float).mean() if optical_n > 0 else None
+    optical_good_pct = (
+        (cx_df.loc[_optical_mask, 'OPTICAL_HEALTH'] == 'Good').sum() / optical_n * 100
+        if optical_n > 0 else None
+    )
+
+    _speed_mask = cx_df['ACTUAL_SPEED_MBPS'].notna()
+    speed_n = int(_speed_mask.sum())
+    avg_speed = cx_df.loc[_speed_mask, 'ACTUAL_SPEED_MBPS'].apply(safe_float).mean() if speed_n > 0 else None
+else:
+    optical_n = speed_n = 0
+    avg_optical = optical_good_pct = avg_speed = None
+
 # ── Partner Header ─────────────────────────────────────────────────────────────
 # Rating: use SERVICE_RATING from PARTNER_JANAM_KUNDLI (actual partner rating score)
 service_rating = safe_float(pjk.get('service_rating'))
@@ -576,6 +721,25 @@ d1, d2, d3 = st.columns(3)
 d1.metric("ONT w/ Partner", ont_with_partner, help="Devices not yet linked to any customer (partner stock)")
 d2.metric("ONT w/ Active Customer", ont_with_active, help="Devices linked to a customer who has not churned")
 d3.metric("ONT w/ Churned Customer", ont_with_churned, help="Devices linked to a customer who has churned")
+
+_cx_total = len(cx_df) if cx_df is not None else 0
+st.caption(
+    "📡 **Optical Power & Speed** — average across customers with a live reading "
+    "(from PROD_DB.DBT.FCT_OPTICAL_SIGNAL / DAILY_SPEED_TEST; most customers won't have one yet)"
+)
+o1, o2, o3 = st.columns(3)
+o1.metric(
+    "Avg Optical Power", f"{avg_optical:.1f} dBm" if avg_optical is not None else "N/A",
+    help=f"{optical_n} of {_cx_total} customers have a reading"
+)
+o2.metric(
+    "Optical Health (Good)", f"{optical_good_pct:.0f}%" if optical_good_pct is not None else "N/A",
+    help="Share of customers with a reading whose OPTICAL_HEALTH = 'Good'"
+)
+o3.metric(
+    "Avg Speed", f"{avg_speed:.0f} Mbps" if avg_speed is not None else "N/A",
+    help=f"{speed_n} of {_cx_total} customers have a speed test result"
+)
 
 if _sla_stale:
     st.warning(f"⚠️ Showing **{m2_label}** SLA (most recent available) — {m1_label} & {m0_label} data not yet loaded in the pipeline.", icon=None)
@@ -857,109 +1021,8 @@ st.divider()
 # ── Customer Data ─────────────────────────────────────────────────────────────
 st.subheader("👤 All Customers")
 
-@st.cache_data(ttl=3600)
-def fetch_customer_data(pid):
-    sql = f"""
-    WITH partner_mobiles AS (
-        SELECT DISTINCT MOBILE, MAX(NAS_ID) AS NAS_ID
-        FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
-        WHERE LCO_ACCOUNT_ID = {pid}
-        GROUP BY MOBILE
-    ),
-    current_plan AS (
-        SELECT MOBILE,
-               DATEADD('minute', 330, PLAN_START_TIME)                                              AS LAST_RECHARGE_IST,
-               DATEADD('minute', 330, DATEADD('second', TIME_PLAN, PLAN_START_TIME))               AS PLAN_EXPIRY_IST,
-               CHARGES,
-               ROUND(TIME_PLAN / 86400.0, 0)                                                       AS PLAN_DAYS,
-               SPEED_MBPS
-        FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
-        WHERE LCO_ACCOUNT_ID = {pid}
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY MOBILE ORDER BY PLAN_START_TIME DESC) = 1
-    ),
-    cx_info AS (
-        SELECT b.MOBILE, b.NAME AS CUSTOMER_NAME
-        FROM PROD_DB.DYNAMODB_READ.BOOKING b
-        WHERE b.MOBILE IN (SELECT MOBILE FROM partner_mobiles)
-          AND b._FIVETRAN_DELETED = FALSE
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY b.MOBILE ORDER BY b.MOBILE) = 1
-    ),
-    addr_info AS (
-        SELECT bl.MOBILE,
-               CONCAT_WS(', ',
-                   NULLIF(TRY_PARSE_JSON(TRY_PARSE_JSON(bl.DATA):address::STRING):home::STRING, ''),
-                   NULLIF(TRY_PARSE_JSON(TRY_PARSE_JSON(bl.DATA):address::STRING):city::STRING, '')
-               ) AS ADDRESS
-        FROM PROD_DB.PUBLIC.BOOKING_LOGS bl
-        WHERE bl.MOBILE IN (SELECT MOBILE FROM partner_mobiles)
-          AND bl.EVENT_NAME = 'address_updated'
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY bl.MOBILE ORDER BY bl.ADDED_TIME DESC) = 1
-    ),
-    last_ping AS (
-        SELECT pm.MOBILE,
-               MAX(u.ADDED_DATE) AS LAST_PING_DATE
-        FROM partner_mobiles pm
-        JOIN PROD_DB.PUBLIC.CUSTOMER_DAILY_DATA_USAGE u ON u.NASID = pm.NAS_ID
-        GROUP BY pm.MOBILE
-    ),
-    install_date AS (
-        SELECT MOBILE,
-               TO_DATE(DATEADD('minute', 330, MIN(ADDED_TIME))) AS INSTALL_DATE
-        FROM PROD_DB.PUBLIC.TASK_LOGS
-        WHERE MOBILE IN (SELECT MOBILE FROM partner_mobiles)
-          AND EVENT_NAME = 'OTP_VERIFIED'
-        GROUP BY MOBILE
-    ),
-    recharge_count AS (
-        SELECT MOBILE, COUNT(*) AS RECHARGE_COUNT
-        FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
-        WHERE LCO_ACCOUNT_ID = {pid}
-          AND CHARGES > 0
-        GROUP BY MOBILE
-    )
-    SELECT
-        pm.MOBILE,
-        COALESCE(cx.CUSTOMER_NAME, pm.MOBILE)                                           AS NAME,
-        ai.ADDRESS,
-        id.INSTALL_DATE                                                                  AS INSTALL_DATE,
-        lp.LAST_PING_DATE                                                                AS LAST_PING,
-        cp.LAST_RECHARGE_IST                                                             AS LAST_RECHARGE,
-        COALESCE(rc.RECHARGE_COUNT, 0)                                                   AS RECHARGE_COUNT,
-        cp.PLAN_EXPIRY_IST                                                               AS PLAN_EXPIRY,
-        CONCAT_WS(' | ',
-            NULLIF(cp.SPEED_MBPS::STRING || ' Mbps', ' Mbps'),
-            NULLIF(cp.PLAN_DAYS::INT::STRING || 'd', 'd'),
-            NULLIF('Rs ' || cp.CHARGES::INT::STRING, 'Rs ')
-        )                                                                                AS PLAN_DETAILS,
-        CASE
-            WHEN cp.PLAN_EXPIRY_IST IS NULL THEN NULL
-            WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN NULL
-            ELSE DATEDIFF('day', cp.PLAN_EXPIRY_IST::DATE, CURRENT_DATE)
-        END                                                                              AS DAYS_SINCE_EXPIRY,
-        CASE
-            WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN 'Active'
-            WHEN cp.PLAN_EXPIRY_IST IS NULL THEN 'No Plan'
-            ELSE 'Expired'
-        END                                                                              AS STATUS
-    FROM partner_mobiles pm
-    LEFT JOIN cx_info        cx ON cx.MOBILE = pm.MOBILE
-    LEFT JOIN addr_info      ai ON ai.MOBILE = pm.MOBILE
-    LEFT JOIN current_plan   cp ON cp.MOBILE = pm.MOBILE
-    LEFT JOIN last_ping      lp ON lp.MOBILE = pm.MOBILE
-    LEFT JOIN install_date   id ON id.MOBILE = pm.MOBILE
-    LEFT JOIN recharge_count rc ON rc.MOBILE = pm.MOBILE
-    ORDER BY
-        CASE WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN 0 ELSE 1 END,
-        cp.PLAN_EXPIRY_IST DESC NULLS LAST
-    """
-    return run_sql(sql)
-
-with st.spinner("Loading customer data..."):
-    try:
-        cx_df = fetch_customer_data(partner_id)
-    except Exception as e:
-        cx_df = None
-        st.error(f"Could not load customer data: {e}")
+if cx_df is None:
+    st.error(f"Could not load customer data: {cx_data_err}")
 
 if cx_df is not None and len(cx_df) > 0:
     total_cx   = len(cx_df)
@@ -993,6 +1056,9 @@ if cx_df is not None and len(cx_df) > 0:
     disp_cx['PLAN_DETAILS'] = disp_cx['PLAN_DETAILS'].apply(lambda x: str(x) if x else '—')
     disp_cx['INSTALL_DATE'] = disp_cx['INSTALL_DATE'].apply(lambda x: str(x)[:10] if x else '—')
     disp_cx['RECHARGE_COUNT'] = disp_cx['RECHARGE_COUNT'].apply(lambda x: safe_int(x) if x else 0)
+    disp_cx['AVG_OPTICAL_DBM'] = disp_cx['AVG_OPTICAL_DBM'].apply(lambda x: f"{safe_float(x):.1f}" if pd.notna(x) else '—')
+    disp_cx['OPTICAL_HEALTH'] = disp_cx['OPTICAL_HEALTH'].apply(lambda x: str(x) if pd.notna(x) else '—')
+    disp_cx['ACTUAL_SPEED_MBPS'] = disp_cx['ACTUAL_SPEED_MBPS'].apply(lambda x: f"{safe_float(x):.1f}" if pd.notna(x) else '—')
 
     disp_cx = disp_cx.rename(columns={
         'MOBILE': 'Mobile',
@@ -1006,11 +1072,15 @@ if cx_df is not None and len(cx_df) > 0:
         'PLAN_DETAILS': 'Plan',
         'DAYS_SINCE_EXPIRY': 'Since Expiry',
         'STATUS': 'Status',
+        'AVG_OPTICAL_DBM': 'Optical (dBm)',
+        'OPTICAL_HEALTH': 'Optical Health',
+        'ACTUAL_SPEED_MBPS': 'Speed (Mbps)',
     })
 
     st.dataframe(
         disp_cx[['Mobile', 'Name', 'Address', 'Installed On', 'Last Ping', 'Last Recharge',
-                 'Recharges', 'Plan Expiry', 'Plan', 'Since Expiry', 'Status']],
+                 'Recharges', 'Plan Expiry', 'Plan', 'Since Expiry', 'Status',
+                 'Optical (dBm)', 'Optical Health', 'Speed (Mbps)']],
         use_container_width=True,
         hide_index=True
     )
