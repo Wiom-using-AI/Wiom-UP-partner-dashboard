@@ -814,6 +814,9 @@ if pgc is not None:
         if live_svc_m1 > 0 or live_dev_m1 > 0:
             svc_tickets[1] = live_svc_m1
             dev_tickets[1] = live_dev_m1
+            if live_sla_m1:
+                svc_sla_cnt[1] = live_sla_m1.get('SERVICE', (0, 0))[1]
+                dev_sla_cnt[1] = live_sla_m1.get('ROUTER_PICKUP', (0, 0))[1]
             ticket_notes.append(f"**{m1_label}** pulled live from TICKETVANILLA (growth card not yet populated)")
 
     # Backfill M0 (current month MTD) from TICKETVANILLA if growth card shows 0
@@ -822,6 +825,9 @@ if pgc is not None:
         if live_svc > 0 or live_dev > 0:
             svc_tickets[2] = live_svc
             dev_tickets[2] = live_dev
+            if live_sla_m0:
+                svc_sla_cnt[2] = live_sla_m0.get('SERVICE', (0, 0))[1]
+                dev_sla_cnt[2] = live_sla_m0.get('ROUTER_PICKUP', (0, 0))[1]
             ticket_notes.append(f"**{m0_label}** is MTD (live from TICKETVANILLA · SLA calculated at month-end)")
 
     if ticket_notes:
