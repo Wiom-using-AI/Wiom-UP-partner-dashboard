@@ -261,10 +261,25 @@ def fetch_live_sla_range(partner_id, start_date, end_date=None):
 def fetch_customer_data(pid):
     sql = f"""
     WITH partner_mobiles AS (
-        SELECT DISTINCT MOBILE, MAX(NAS_ID) AS NAS_ID, MAX(DEVICE_ID) AS DEVICE_ID
+        SELECT DISTINCT MOBILE, MAX(NAS_ID) AS NAS_ID, MAX(DEVICE_ID) AS DEVICE_ID, MAX(ACCOUNT_ID) AS ACCOUNT_ID
         FROM PROD_DB.DYNAMODB_READ.HOME_ROUTER_PLAN_INFO
         WHERE LCO_ACCOUNT_ID = {pid}
         GROUP BY MOBILE
+    ),
+    device_lookup AS (
+        -- Fallback DEVICE_ID source: some partners (e.g. A To Z Cable Network) have NULL
+        -- DEVICE_ID in HOME_ROUTER_PLAN_INFO for every customer, so speed test never
+        -- matched. WIOM_DEVICE_DATA.CUSTOMER_ID = HOME_ROUTER_PLAN_INFO.ACCOUNT_ID still
+        -- resolves the device in those cases (same source used for ONT counts above).
+        SELECT CUSTOMER_ID, MAX(DEVICE_ID) AS DEVICE_ID
+        FROM PROD_DB.PUBLIC.WIOM_DEVICE_DATA
+        WHERE PARTNER_ID = '{pid}'
+        GROUP BY CUSTOMER_ID
+    ),
+    resolved_devices AS (
+        SELECT pm.MOBILE, COALESCE(pm.DEVICE_ID, dl.DEVICE_ID) AS DEVICE_ID
+        FROM partner_mobiles pm
+        LEFT JOIN device_lookup dl ON dl.CUSTOMER_ID = pm.ACCOUNT_ID::STRING
     ),
     current_plan AS (
         SELECT MOBILE,
@@ -327,7 +342,7 @@ def fetch_customer_data(pid):
         SELECT DEVICEID, SPEED, LATENCY, JITTER, TESTED_ON,
                ROW_NUMBER() OVER (PARTITION BY DEVICEID ORDER BY TESTED_ON DESC) AS rn
         FROM PROD_DB.DBT.DAILY_SPEED_TEST
-        WHERE DEVICEID IN (SELECT DEVICE_ID FROM partner_mobiles WHERE DEVICE_ID IS NOT NULL)
+        WHERE DEVICEID IN (SELECT DEVICE_ID FROM resolved_devices WHERE DEVICE_ID IS NOT NULL)
     )
     SELECT
         pm.MOBILE,
@@ -361,14 +376,15 @@ def fetch_customer_data(pid):
         spd.JITTER                                                                       AS JITTER,
         spd.TESTED_ON                                                                    AS TESTED_ON
     FROM partner_mobiles pm
-    LEFT JOIN cx_info        cx  ON cx.MOBILE = pm.MOBILE
-    LEFT JOIN addr_info      ai  ON ai.MOBILE = pm.MOBILE
-    LEFT JOIN current_plan   cp  ON cp.MOBILE = pm.MOBILE
-    LEFT JOIN last_ping      lp  ON lp.MOBILE = pm.MOBILE
-    LEFT JOIN install_date   id  ON id.MOBILE = pm.MOBILE
-    LEFT JOIN recharge_count rc  ON rc.MOBILE = pm.MOBILE
-    LEFT JOIN latest_optical opt ON opt.NAS_ID = pm.NAS_ID AND opt.rn = 1
-    LEFT JOIN latest_speed   spd ON spd.DEVICEID = pm.DEVICE_ID AND spd.rn = 1
+    LEFT JOIN cx_info         cx  ON cx.MOBILE = pm.MOBILE
+    LEFT JOIN addr_info       ai  ON ai.MOBILE = pm.MOBILE
+    LEFT JOIN current_plan    cp  ON cp.MOBILE = pm.MOBILE
+    LEFT JOIN last_ping       lp  ON lp.MOBILE = pm.MOBILE
+    LEFT JOIN install_date    id  ON id.MOBILE = pm.MOBILE
+    LEFT JOIN recharge_count  rc  ON rc.MOBILE = pm.MOBILE
+    LEFT JOIN resolved_devices rd ON rd.MOBILE = pm.MOBILE
+    LEFT JOIN latest_optical  opt ON opt.NAS_ID = pm.NAS_ID AND opt.rn = 1
+    LEFT JOIN latest_speed    spd ON spd.DEVICEID = rd.DEVICE_ID AND spd.rn = 1
     ORDER BY
         CASE WHEN cp.PLAN_EXPIRY_IST::TIMESTAMP >= CURRENT_TIMESTAMP THEN 0 ELSE 1 END,
         cp.PLAN_EXPIRY_IST DESC NULLS LAST
